@@ -1,0 +1,13 @@
+{
+  "adapters": {
+    "debugpy": {
+      "launchDefaults": {
+        "python": ".venv/bin/python",
+        "env": {
+          "PYTHONPATH": ".venv/lib/python3.13/site-packages:python"
+        },
+        "stopOnEntry": true
+      }
+    }
+  }
+}

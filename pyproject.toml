@@ -70,7 +70,7 @@ Issues = "https://github.com/FlashML-org/FreeToken/issues"
 ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=6.0"]
+dev = ["pytest>=6.0", "debugpy>=1.8,<2"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.

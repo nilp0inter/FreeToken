@@ -1,0 +1,24 @@
+{
+  "servers": {
+    "clangd": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "root=\"$PWD\"; site=\"$root/.venv/lib/python3.13/site-packages\"; python_include=\"$(python -c 'import sysconfig; print(sysconfig.get_path(\"include\"))')\"; printf '%s\\n' 'CompileFlags:' '  Compiler: g++' '  Add:' '    - -std=c++20' \"    - -I$root/python/freetoken/kernel/csrc/include\" \"    - -I$site/torch/include\" \"    - -I$site/torch/include/torch/csrc/api/include\" \"    - -I$site/tvm_ffi/include\" \"    - -I$site/tvm_ffi/3rdparty/dlpack/include\" \"    - -I$site/nvidia/nccl/include\" \"    - -I$CUDA_HOME/include\" \"    - -I$python_include\" > \"$root/.clangd\"; export CPLUS_INCLUDE_PATH=\"$root/python/freetoken/kernel/csrc/include:$site/torch/include:$site/torch/include/torch/csrc/api/include:$site/tvm_ffi/include:$site/tvm_ffi/3rdparty/dlpack/include:$site/nvidia/nccl/include:$CUDA_HOME/include:$python_include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}\"; exec direnv exec \"$root\" clangd"
+      ],
+      "fileTypes": [
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx",
+        ".cu",
+        ".cuh"
+      ],
+      "rootMarkers": ["pyproject.toml", ".git"]
+    }
+  }
+}

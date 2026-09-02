@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+# Clangd local compilation flags
+.clangd
 
 # Distribution / packaging
 .Python
@@ -149,6 +151,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.direnv/
 .venv
 env/
 venv/
