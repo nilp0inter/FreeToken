@@ -95,7 +95,8 @@ number of expert rows in host RAM. Bounded mode requires `--moe-backend offload`
 disables MoE prefill overlap and CUDA graphs, and loads cache misses
 synchronously.
 
-For `auto`, FreeToken uses `MemAvailable` minus an 8 GiB reserve. Set
+For `auto`, FreeToken uses the smaller of `MemAvailable` and the remaining
+cgroup memory allowance, minus an 8 GiB reserve. Set
 `FREETOKEN_MOE_RAM_RESERVE_GB` to change the reserve.
 
 ### API behaviour

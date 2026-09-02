@@ -114,6 +114,10 @@ def _mem_available_bytes() -> int | None:
 
     # A container can expose the host's MemAvailable while enforcing a smaller
     # cgroup limit.  Cap the usable value by the remaining cgroup allowance.
+    # cgroup v2 keeps the pair in the unified hierarchy; v1 hosts keep it under
+    # the memory controller.  Inside a cgroup namespace either path is the
+    # container's own cgroup root.
+    limit = current = None
     try:
         with open("/sys/fs/cgroup/memory.max", encoding="utf-8") as stream:
             raw_limit = stream.read().strip()
@@ -121,9 +125,18 @@ def _mem_available_bytes() -> int | None:
             limit = int(raw_limit)
             with open("/sys/fs/cgroup/memory.current", encoding="utf-8") as stream:
                 current = int(stream.read().strip())
-            available = min(available, max(0, limit - current))
     except (OSError, ValueError):
-        pass
+        limit = current = None
+    if limit is None or current is None:
+        try:
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", encoding="utf-8") as stream:
+                limit = int(stream.read().strip())
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", encoding="utf-8") as stream:
+                current = int(stream.read().strip())
+        except (OSError, ValueError):
+            limit = current = None
+    if limit is not None and current is not None:
+        available = min(available, max(0, limit - current))
     return available
 
 
