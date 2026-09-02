@@ -174,6 +174,8 @@ class FrontendManager:
     # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
     # (the running snapshot channel) has anything. None until meta arrives.
     cache_pools: Dict[str, int] | None = None
+    # Bounded MoE host-RAM cache status from the readiness/rebuild metadata.
+    ram_cache: Dict[str, Any] | None = None
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
@@ -277,8 +279,12 @@ class FrontendManager:
             "num_pages": msg.num_pages,
             "mamba_slots": msg.mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
+            "ram_bytes": getattr(msg, "ram_bytes", 0),
+            "ram_cache": getattr(msg, "ram_cache", None),
             "error": msg.error,
         }
+        if isinstance(self.last_rebuild["ram_cache"], dict):
+            self.ram_cache = self.last_rebuild["ram_cache"]
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(self.last_rebuild)
@@ -480,6 +486,8 @@ async def _record_request_middleware(request: Request, call_next):
 class CacheRebuildRequest(BaseModel):
     moe_cache_size: int | None = None
     num_pages: int | None = None
+    # Host-wide bounded MoE RAM target in bytes. It is divided across TP ranks by the engine.
+    ram_bytes: int | None = None
     # Usable GDN (mamba) state-pool slots (matches the status-bar total); the engine adds the
     # reserved padding sink internally.
     num_mamba_slots: int | None = None
@@ -504,6 +512,7 @@ async def dispatch_rebuild(
     num_pages: int | None,
     num_mamba_slots: int | None = None,
     num_swa_pages: int | None = None,
+    ram_bytes: int | None = None,
     mode: str = "if_idle",
     timeout: float = 300.0,
 ) -> Dict[str, Any]:
@@ -524,6 +533,7 @@ async def dispatch_rebuild(
                 num_pages=num_pages,
                 num_mamba_slots=num_mamba_slots,
                 num_swa_pages=num_swa_pages,
+                ram_bytes=ram_bytes,
                 mode=mode,
             )
         )
@@ -591,6 +601,11 @@ async def cache_rebuild(req: CacheRebuildRequest):
             {"status": "busy", "error": "engine stop is in progress"},
             status_code=409,
         )
+    if req.ram_bytes is not None and req.ram_bytes <= 0:
+        return JSONResponse(
+            {"status": "failed", "error": "ram_bytes must be positive"},
+            status_code=422,
+        )
     if req.num_swa_pages is not None and req.swa_full_tokens_ratio is not None:
         return JSONResponse(
             {"status": "failed", "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both"},
@@ -607,6 +622,7 @@ async def cache_rebuild(req: CacheRebuildRequest):
         num_pages=req.num_pages,
         num_mamba_slots=req.num_mamba_slots,
         num_swa_pages=_resolve_num_swa_pages(state, req),
+        ram_bytes=req.ram_bytes,
         mode=req.mode,
         timeout=req.timeout,
     )
@@ -748,6 +764,13 @@ def cache_geometry(state: Any) -> dict:
     except Exception:
         num_experts = 0
         num_moe_layers = 0
+    ram_cache = last.get("ram_cache")
+    if not isinstance(ram_cache, dict):
+        ram_cache = getattr(state, "ram_cache", None)
+    ram_bytes = (
+        int(ram_cache.get("requested_bytes", 0) or 0)
+        if isinstance(ram_cache, dict) else 0
+    )
     # Per-unit VRAM costs from the backend's ("meta", …) ack (compute_cache_unit_bytes). All 0
     # when the meta never arrived (older engine build / still loading) or a dummy config is in
     # play; same defensive guard as num_experts so a missing/odd unit_bytes can't 500 the poll.
@@ -781,6 +804,8 @@ def cache_geometry(state: Any) -> dict:
         # pool without having to know how the server was started.
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),
         "unit_bytes": unit_bytes,
+        "ram_bytes": ram_bytes,
+        "ram_cache": ram_cache,
         "swa_full_tokens_ratio": swa_full_tokens_ratio,
         # The window pool's page unit for num_swa_pages: DSV4 = P (== page_size), radix-SWA = 1
         # token, 0 for models without a window pool. Lets a client denominate the swa control.
@@ -1010,6 +1035,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
         _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
+        _GLOBAL_STATE.ram_cache = meta.pop("ram_cache", None)
         _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])

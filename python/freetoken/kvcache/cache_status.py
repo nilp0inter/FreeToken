@@ -194,6 +194,11 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
+    ram_cache = getattr(getattr(engine, "moe_offload_cache", None), "ram_cache", None)
+    try:
+        meta["ram_cache"] = ram_cache.status() if ram_cache is not None else None
+    except Exception:  # noqa: BLE001 -- status must never block readiness
+        meta["ram_cache"] = None
     # Current window/full reuse ratio (the tunable knob), for DSV4 and radix-SWA; 0.0 otherwise.
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)

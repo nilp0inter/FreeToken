@@ -94,6 +94,7 @@ def parse_args(
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
     from freetoken.moe import SUPPORTED_MOE_BACKENDS
+    from freetoken.moe.host_cache import parse_ram_cache_size
 
     def _parse_moe_cache_rate(value: str) -> float:
         try:
@@ -103,7 +104,13 @@ def parse_args(
         if not 0 <= rate <= 1:
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
-
+    def _parse_moe_ram_cache_size(value: str) -> int | str:
+        try:
+            parsed = parse_ram_cache_size(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+        assert parsed is not None
+        return parsed
     def _positive_int(value: str) -> int:
         try:
             n = int(value)
@@ -530,6 +537,17 @@ def parse_args(
         help=(
             "Auto-pick --moe-cache-size from free VRAM and expert size, MoE-priority "
             "(KV gets --kv-reserve-tokens as a floor). Not supported for owned-KV models."
+        ),
+    )
+    parser.add_argument(
+        "--moe-ram-cache-size",
+        type=_parse_moe_ram_cache_size,
+        default=ServerArgs.moe_ram_cache_size,
+        help=(
+            "Bound host RAM used for MoE experts loaded from FTW/NVMe. "
+            "Accepts bytes, K/M/G/T, 'auto' (MemAvailable minus reserve), or "
+            "'all' (the existing full host-bank path). Bounded mode uses eager "
+            "GPU offload and disables CUDA graphs and prefill overlap."
         ),
     )
 

@@ -279,7 +279,7 @@ def test_cache_rebuild_timeout_keeps_gate_closed():
     api_server._GLOBAL_STATE = state
     try:
         resp = asyncio.run(
-            cache_rebuild(CacheRebuildRequest(moe_cache_size=8, timeout=0.05))
+            cache_rebuild(CacheRebuildRequest(moe_cache_size=8, ram_bytes=64, timeout=0.05))
         )  # future never resolves -> times out
     finally:
         api_server._GLOBAL_STATE = None
@@ -288,6 +288,7 @@ def test_cache_rebuild_timeout_keeps_gate_closed():
     assert state.maintenance_state == "rebuilding"  # gate stays closed
     assert state.rebuild_futures == {}  # cancelled future dropped, no leak
     assert len(sent) == 1  # the rebuild request was still dispatched to the backend
+    assert sent[0].ram_bytes == 64
 
 
 def test_cache_rebuild_send_failure_rolls_back_gate():

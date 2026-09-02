@@ -12,9 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-# Every pool the rebuild endpoint knows about, and the unit a user types it in. Which of them
-# a given model actually has is decided per server -- see CachePools.
-CACHE_UNITS = {"moe": "slots", "kv": "tokens", "mamba": "slots", "swa": "tokens"}
+CACHE_UNITS = {
+    "moe": "slots",
+    "kv": "tokens",
+    "mamba": "slots",
+    "swa": "tokens",
+    "ram": "bytes",
+}
 
 
 def _int(source: dict, key: str) -> int:
@@ -38,13 +42,18 @@ class CachePools:
     kv: bool = True  # every model has a KV pool; the rebuild endpoint always takes num_pages
     mamba: bool = False
     swa: bool = False
+    ram: bool = False
 
     @property
     def targets(self) -> Tuple[str, ...]:
         return tuple(
             name
             for name, present in (
-                ("moe", self.moe), ("kv", self.kv), ("mamba", self.mamba), ("swa", self.swa)
+                ("moe", self.moe),
+                ("ram", self.ram),
+                ("kv", self.kv),
+                ("mamba", self.mamba),
+                ("swa", self.swa),
             )
             if present
         )
@@ -58,6 +67,7 @@ class CachePools:
             mamba=bool(_int(geometry, "num_mamba_slots") or _int(unit, "mamba_per_slot")),
             # swa_page_size is the definitive signal: it is only non-zero for a window pool.
             swa=bool(_int(geometry, "swa_page_size") or _int(unit, "swa_per_token")),
+            ram=isinstance((geometry or {}).get("ram_cache"), dict),
         )
 
 
@@ -195,8 +205,20 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
             # what is already allocated. An auto-sized pool can sit above it (and then every
             # rebuild is rejected), so calling it "of X" would read as an arithmetic error.
             header += f" (rebuild budget {format_bytes(budget)})"
+    ram = geometry.get("ram_cache")
+    ram_line = None
+    if isinstance(ram, dict):
+        ram_line = (
+            "  ram "
+            f"{format_bytes(_int(ram, 'requested_bytes'))} requested, "
+            f"{format_bytes(_int(ram, 'allocated_bytes'))} allocated, "
+            f"warm={_int(ram, 'warm_experts')}, "
+            f"hits={_int(ram, 'hits')}, misses={_int(ram, 'misses')}, "
+            f"evictions={_int(ram, 'evictions')}, "
+            f"disk={format_bytes(_int(ram, 'disk_bytes'))}"
+        )
     if not rows:
-        return header
+        return "\n".join([header] + ([ram_line] if ram_line else []))
 
     with_vram = bool(known)
     with_range = any(resize for _pool, _detail, _size, resize in rows)
@@ -212,7 +234,13 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
         table.append(cells)
 
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
-    return "\n".join(
-        [header]
-        + ["  " + "  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in table]
-    )
+    table_lines = [
+        header,
+        *[
+            "  " + "  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip()
+            for row in table
+        ],
+    ]
+    if ram_line:
+        table_lines.append(ram_line)
+    return "\n".join(table_lines)

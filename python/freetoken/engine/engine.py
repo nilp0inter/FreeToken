@@ -487,13 +487,17 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        if hasattr(banks, "logical_bytes_per_expert"):
+            per_expert_bytes = banks.logical_bytes_per_expert
+        else:
+            per_expert_bytes = expert_bytes_per_slot(banks.sources)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -507,6 +511,32 @@ class Engine:
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
         cache_factory = getattr(self.model, "make_offload_moe_cache", None)
+        from freetoken.moe.host_cache import (
+            HostExpertCache,
+            NvmeExpertStore,
+            is_bounded_ram_cache,
+        )
+
+        ram_request = getattr(config, "moe_ram_cache_size", None)
+        bounded_ram = is_bounded_ram_cache(ram_request)
+        if bounded_ram and cache_factory is not None:
+            raise ValueError(
+                "bounded MoE RAM cache is not supported with a custom "
+                "make_offload_moe_cache factory"
+            )
+        if bounded_ram and config.moe_backend != "offload":
+            raise ValueError(
+                "--moe-ram-cache-size requires --moe-backend offload; "
+                "CPU and hybrid decode paths need resident host banks"
+            )
+        if bounded_ram:
+            from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+            if not is_ftw_checkpoint(config.model_path):
+                raise ValueError(
+                    "--moe-ram-cache-size requires an FTW checkpoint so expert "
+                    "rows can be read from NVMe"
+                )
         if cache_factory is not None and config.moe_cache_auto:
             raise ValueError(
                 "--moe-cache-auto is not supported for models with a custom "
@@ -565,7 +595,23 @@ class Engine:
                 "(locked layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
-        if cache_factory is None:
+        banks: Any = None
+        cache: OffloadMoeCache | None = None
+        host_cache = None
+        if bounded_ram:
+            assert ram_request is not None
+            banks = NvmeExpertStore(
+                config.model_path,
+                num_layers=config.model_config.num_moe_layers,
+                num_experts=config.model_config.num_experts,
+            )
+            host_cache = HostExpertCache.from_request(
+                banks,
+                ram_request,
+                tp_size=config.tp_info.size,
+                pin=True,
+            )
+        elif cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
             # expert-tensor granularity. Both pin-after-fill.
@@ -591,18 +637,25 @@ class Engine:
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
+        else:
+            cache = cache_factory(config, self.device)
+            assert cache is not None
+            cache.decode_target = decode_target
+            cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
+            cache.cpu_layer_ids = cpu_layer_ids
+
+        if cache_factory is None:
+            assert banks is not None
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
                 object.__setattr__(config, "moe_prefill_overlap", overlap)
                 if config.num_page_override is None:
                     # Honor the plan's KV half too: MoE slots and KV pages were solved
-                    # against ONE budget (ratio x baseline - weights), so both must come
-                    # from it. Re-solving pages later from a fresh free-memory reading
-                    # double-counts everything allocated since the weights measurement
-                    # (this expert cache, the CPU-executor GPU buffers, allocator
-                    # slack) and goes negative whenever the expert fill is exact --
-                    # a greedy fill leaves no headroom for the measurement delta.
+                    # against ONE budget (ratio x baseline - weights), so both must
+                    # come from it. Re-solving pages later from a fresh free-memory
+                    # reading would double-count everything allocated since the weights
+                    # measurement.
                     object.__setattr__(config, "num_page_override", pages)
                 logger.info_rank0(
                     f"--moe-cache-auto resolved moe_cache_size={size} "
@@ -623,15 +676,20 @@ class Engine:
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
-            # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
-            cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
-        else:
-            cache = cache_factory(config, self.device)
-            cache.decode_target = decode_target
-            cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
-            cache.cpu_layer_ids = cpu_layer_ids
+            if bounded_ram:
+                assert host_cache is not None
+                cache.set_bounded_host_cache(host_cache)
+                cache.set_alphas(
+                    banks.alpha("gate_up_alpha"),
+                    banks.alpha("down_alpha"),
+                )
+            else:
+                cache.set_bank_sources(
+                    banks.sources, layer_residency=banks.layer_residency
+                )
+                cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        assert cache is not None
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -742,10 +800,12 @@ class Engine:
             if moe_cache_size is not None
             else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
         )
-        per_expert_bytes = (
-            expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
-            if self.moe_offload_cache is not None else 0
-        )
+        if self.moe_offload_cache is None:
+            per_expert_bytes = 0
+        elif self.moe_offload_cache.ram_cache is not None:
+            per_expert_bytes = self.moe_offload_cache.expert_bytes_per_slot
+        else:
+            per_expert_bytes = expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
         return target_moe, per_expert_bytes
 
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
@@ -783,15 +843,22 @@ class Engine:
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        ram_bytes: int | None = None,
     ) -> None:
         """Idle-only in-place resize of the MoE slot cache, KV page pool, GDN (mamba) state pool,
-        and/or the window pool (num_swa_pages: an absolute pinned window), followed by CUDA-graph
-        re-capture. Does NOT reload weights or host expert banks. The caller (scheduler) must
+        window pool, and bounded host-RAM expert arena. GPU pool changes re-capture CUDA graphs.
+        A RAM-only change updates the eager FTW row cache without touching GPU geometry.
+        Does NOT reload weights or full resident host expert banks. The caller (scheduler) must
         guarantee no in-flight prefill/decode.
         """
         config = self.config
-        if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
-                and num_swa_pages is None):
+        if (
+            moe_cache_size is None
+            and num_pages is None
+            and num_mamba_slots is None
+            and num_swa_pages is None
+            and ram_bytes is None
+        ):
             return
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
@@ -806,6 +873,20 @@ class Engine:
                 )
             try:
                 self.moe_offload_cache.validate_rebuild(moe_cache_size)
+            except ValueError as e:
+                raise CacheRebuildRejected(str(e)) from e
+        ram_per_rank = None
+        if ram_bytes is not None:
+            if ram_bytes <= 0:
+                raise CacheRebuildRejected(f"ram_bytes must be positive, got {ram_bytes}")
+            if self.moe_offload_cache is None or self.moe_offload_cache.ram_cache is None:
+                raise CacheRebuildRejected(
+                    "ram_bytes requested but bounded FTW MoE RAM cache is not enabled"
+                )
+            tp_size = max(1, int(config.tp_info.size))
+            ram_per_rank = ram_bytes // tp_size
+            try:
+                self.moe_offload_cache.ram_cache.validate_per_rank_budget(ram_per_rank)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
         if num_pages is not None and num_pages <= 0:
@@ -862,6 +943,23 @@ class Engine:
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
         )
+        gpu_resize = (
+            moe_cache_size is not None
+            or num_pages is not None
+            or num_mamba_slots is not None
+            or num_swa_pages is not None
+        )
+        if ram_per_rank is not None:
+            assert self.moe_offload_cache is not None
+            assert ram_bytes is not None
+            self.moe_offload_cache.rebuild_ram_cache(
+                ram_bytes,
+                per_rank_budget_bytes=ram_per_rank,
+            )
+            object.__setattr__(config, "moe_ram_cache_size", ram_bytes)
+            if not gpu_resize:
+                return
+
 
         torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
@@ -1000,9 +1098,10 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.moe_offload_cache is not None and self.moe_offload_cache.ram_cache is not None:
+            self.moe_offload_cache.ram_cache.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
-
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
     """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
@@ -1215,6 +1314,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
+    "moe_ram_cache_size": None,
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
@@ -1229,6 +1329,7 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    requested_moe_backend = config.moe_backend
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
@@ -1429,6 +1530,34 @@ def _adjust_config(config: EngineConfig):
             logger.info_rank0(
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
+            )
+
+    if is_moe:
+        from freetoken.moe.host_cache import is_bounded_ram_cache
+
+        if is_bounded_ram_cache(getattr(config, "moe_ram_cache_size", None)):
+            if config.moe_backend != "offload":
+                if requested_moe_backend == "auto":
+                    override("moe_backend", "offload")
+                    logger.info_rank0(
+                        "Bounded MoE RAM cache keeps auto backend on plain GPU offload"
+                    )
+                else:
+                    raise ValueError(
+                        "--moe-ram-cache-size requires --moe-backend offload; "
+                        "CPU and hybrid decode paths need resident host banks"
+                    )
+            if config.moe_cpu_layers not in (None, "", "0", 0):
+                raise ValueError(
+                    "--moe-ram-cache-size cannot be combined with --moe-cpu-layers"
+                )
+            override("moe_prefill_overlap", False)
+            override("moe_prefill_hit_d2d", False)
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+            logger.info_rank0(
+                "Bounded MoE RAM cache enabled: using eager FTW/NVMe row loads; "
+                "CUDA graphs and prefill overlap are disabled"
             )
 
     if is_moe and config.moe_backend == "fused":

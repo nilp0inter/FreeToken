@@ -67,4 +67,6 @@ class CacheRebuildReply(BaseFrontendMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    ram_bytes: int = 0
+    ram_cache: Dict[str, object] | None = None
     error: str | None = None

@@ -81,12 +81,22 @@ See [models.md](models.md#moe-backends) for what each backend does.
 |---|---|---|
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
+| `--moe-ram-cache-size` | all | Host-RAM budget for expert rows in `offload`; accepts bytes, K/M/G/T, `auto`, or `all`. An explicit budget is divided across tensor-parallel ranks. |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+
+`--moe-ram-cache-size` uses the normal full-RAM expert banks by default. A
+bounded value uses an FTW checkpoint as an NVMe row store and keeps a fixed
+number of expert rows in host RAM. Bounded mode requires `--moe-backend offload`,
+disables MoE prefill overlap and CUDA graphs, and loads cache misses
+synchronously.
+
+For `auto`, FreeToken uses `MemAvailable` minus an 8 GiB reserve. Set
+`FREETOKEN_MOE_RAM_RESERVE_GB` to change the reserve.
 
 ### API behaviour
 

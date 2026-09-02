@@ -91,9 +91,7 @@ def _cache_targets_hint(pools: CachePools) -> str:
     return " | ".join(f"{name} <N>" for name in pools.targets)
 
 
-# A plausible value per target, so the generated example reads like something worth typing
-# (a token count for the paged pools, a slot count for the others) whatever the model has.
-_CACHE_EXAMPLES = {"moe": "4k", "kv": "128k", "mamba": "64", "swa": "32k"}
+_CACHE_EXAMPLES = {"moe": "4k", "kv": "128k", "mamba": "64", "swa": "32k", "ram": "64G"}
 
 
 def _cache_usage(pools: CachePools) -> str:
@@ -116,10 +114,13 @@ def _cache_usage(pools: CachePools) -> str:
         )
         if clause
     ]
+    if any(CACHE_UNITS[name] == "bytes" for name in pools.targets):
+        clauses.append("ram is a byte count (K/M/G/T use powers of 1024)")
     example = " ".join(f"{name} {_CACHE_EXAMPLES[name]}" for name in pools.targets)
     return (
         f"Usage: /cache [status | {_cache_targets_hint(pools)}]; combine targets, e.g. "
-        f"/cache {example}. " + "; ".join(clauses) + ". N accepts a k/m suffix (k=1024, m=1024^2)."
+        f"/cache {example}. " + "; ".join(clauses) + ". "
+        "N accepts a k/m suffix (k=1024, m=1024^2)."
     )
 
 
@@ -138,6 +139,35 @@ def _parse_count(token: str) -> int | None:
     return int(value)
 
 
+def _parse_bytes(token: str) -> int | None:
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d+)?)\s*(b|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib)?\s*",
+        token,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    multiplier = {
+        "b": 1,
+        "k": 1 << 10,
+        "kb": 1 << 10,
+        "kib": 1 << 10,
+        "m": 1 << 20,
+        "mb": 1 << 20,
+        "mib": 1 << 20,
+        "g": 1 << 30,
+        "gb": 1 << 30,
+        "gib": 1 << 30,
+        "t": 1 << 40,
+        "tb": 1 << 40,
+        "tib": 1 << 40,
+    }.get((match.group(2) or "b").lower(), 1)
+    value = float(match.group(1)) * multiplier
+    if value <= 0 or value != int(value):
+        return None
+    return int(value)
+
+
 @dataclass(frozen=True)
 class CacheCommand:
     """A parsed ``/cache`` invocation. ``kv``/``swa`` are token counts as typed -- the page
@@ -148,6 +178,7 @@ class CacheCommand:
     kv_tokens: int | None = None
     mamba: int | None = None
     swa_tokens: int | None = None
+    ram_bytes: int | None = None
     error: str | None = None
 
 
@@ -159,9 +190,10 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
     """Parse ``/cache`` arguments against the pools this model actually has.
 
     No args (or ``status``) is a status query; one or more ``<target> <N>`` pairs is a rebuild.
-    Also accepts the ``key=value`` spelling. ``N`` may carry a k/m suffix and must be positive.
-    Units follow the pool: ``moe``/``mamba`` are slots, ``kv``/``swa`` are tokens (what the
-    status line and the bar report), converted to whole pages against the live geometry."""
+    Also accepts the ``key=value`` spelling. Counts may carry a k/m suffix; ``ram`` accepts
+    binary byte suffixes through T/G.
+    Units follow the pool: ``moe``/``mamba`` are slots, ``kv``/``swa`` are tokens, and ``ram`` is
+    bytes. Token counts are converted to whole pages against the live geometry."""
     if not args or args == ["status"]:
         return CacheCommand(action="status")
     usage = _cache_usage(pools)
@@ -181,10 +213,13 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
             return _cache_error(known + usage)
         if i + 1 >= len(tokens):
             return _cache_error(f"Missing value for {key!r}. {usage}")
-        val = _parse_count(tokens[i + 1])
+        val = _parse_bytes(tokens[i + 1]) if key == "ram" else _parse_count(tokens[i + 1])
         if val is None:
+            expected = "positive bytes (e.g. 512M or 64G)" if key == "ram" else (
+                "positive count (e.g. 512, 1.5k, 2M)"
+            )
             return _cache_error(
-                f"{key!r} expects a positive count (e.g. 512, 1.5k, 2M), got {tokens[i + 1]!r}"
+                f"{key!r} expects {expected}, got {tokens[i + 1]!r}"
             )
         values[key] = val
         i += 2
@@ -196,6 +231,7 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
         kv_tokens=values.get("kv"),
         mamba=values.get("mamba"),
         swa_tokens=values.get("swa"),
+        ram_bytes=values.get("ram"),
     )
 
 
@@ -358,12 +394,11 @@ async def _handle_cache_command(
 
     command = _parse_cache_command(args, pools)
     if command.action == "error":
-        renderer.write(command.error + "\n")
+        renderer.write((command.error or "invalid cache command") + "\n")
         return pools
     if command.action == "status":
         renderer.write(format_cache_status(doc) + "\n")
         return pools
-
     page_size = max(1, int(geometry.get("page_size", 1) or 1))
     swa_page_size = int(geometry.get("swa_page_size", 0) or 0)
     num_pages = pages_for_tokens(command.kv_tokens, page_size)
@@ -385,6 +420,8 @@ async def _handle_cache_command(
             if command.mamba is not None else "",
             _target("swa", format_tokens(num_swa_pages, swa_page_size), num_swa_pages)
             if num_swa_pages is not None else "",
+            _target("ram", f"{command.ram_bytes} bytes", command.ram_bytes)
+            if command.ram_bytes is not None else "",
         )
         if part
     )
@@ -395,6 +432,7 @@ async def _handle_cache_command(
             num_pages=num_pages,
             num_mamba_slots=command.mamba,
             num_swa_pages=num_swa_pages,
+            ram_bytes=command.ram_bytes,
         )
     except ShellClientError as exc:
         renderer.write(f"{exc}\n")

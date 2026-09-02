@@ -24,33 +24,68 @@ from freetoken.core import SamplingParams
 
 
 def test_cache_rebuild_msg_roundtrip():
-    msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle")
+    msg = CacheRebuildMsg(
+        request_id="abc", moe_cache_size=8, num_pages=1024, ram_bytes=64 << 30, mode="if_idle"
+    )
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == ("abc", 8, 1024, "if_idle")
+    assert (out.request_id, out.moe_cache_size, out.num_pages, out.ram_bytes, out.mode) == (
+        "abc", 8, 1024, 64 << 30, "if_idle",
+    )
 
 
 def test_cache_rebuild_backend_msg_roundtrip():
-    msg = CacheRebuildBackendMsg(request_id="r1", moe_cache_size=None, num_pages=256, mode="drain")
+    msg = CacheRebuildBackendMsg(
+        request_id="r1", moe_cache_size=None, num_pages=256, ram_bytes=64 << 30, mode="drain"
+    )
     out = BaseBackendMsg.decoder(msg.encoder())
     assert isinstance(out, CacheRebuildBackendMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == ("r1", None, 256, "drain")
+    assert (out.request_id, out.moe_cache_size, out.num_pages, out.ram_bytes, out.mode) == (
+        "r1", None, 256, 64 << 30, "drain",
+    )
 
 
 def test_cache_rebuild_result_msg_roundtrip():
-    msg = CacheRebuildResultMsg(request_id="r2", status="ok", moe_cache_size=16, num_pages=512)
+    msg = CacheRebuildResultMsg(
+        request_id="r2",
+        status="ok",
+        moe_cache_size=16,
+        num_pages=512,
+        ram_bytes=64 << 30,
+        ram_cache={"mode": "bounded", "warm_experts": 2},
+    )
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildResultMsg)
-    assert (out.request_id, out.status, out.moe_cache_size, out.num_pages, out.error) == (
-        "r2", "ok", 16, 512, None,
+    assert (
+        out.request_id,
+        out.status,
+        out.moe_cache_size,
+        out.num_pages,
+        out.ram_bytes,
+        out.ram_cache,
+        out.error,
+    ) == (
+        "r2", "ok", 16, 512, 64 << 30, {"mode": "bounded", "warm_experts": 2}, None,
     )
 
 
 def test_cache_rebuild_reply_roundtrip():
-    msg = CacheRebuildReply(request_id="r3", status="failed", error="boom")
+    msg = CacheRebuildReply(
+        request_id="r3",
+        status="failed",
+        ram_bytes=64 << 30,
+        ram_cache={"mode": "bounded"},
+        error="boom",
+    )
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
-    assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+    assert (
+        out.request_id,
+        out.status,
+        out.ram_bytes,
+        out.ram_cache,
+        out.error,
+    ) == ("r3", "failed", 64 << 30, {"mode": "bounded"}, "boom")
 
 
 def test_prompt_admitted_msg_roundtrip():

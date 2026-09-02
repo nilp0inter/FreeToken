@@ -33,6 +33,9 @@ class EngineConfig:
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
+    # Bounded host-RAM expert cache: None/"all" keeps the existing full host-bank residency;
+    # an integer/"auto" reads only a fixed number of expert rows from an FTW checkpoint.
+    moe_ram_cache_size: int | str | None = None
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True

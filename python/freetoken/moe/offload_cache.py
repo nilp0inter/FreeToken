@@ -3,9 +3,13 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
 
 import torch
+if TYPE_CHECKING:
+    from freetoken.moe.host_cache import HostExpertCache
+
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
@@ -141,6 +145,9 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # Bounded mode replaces full host bank residency with an FTW/NVMe row store.
+    # It is eager-only: CUDA graphs and prefill overlap are disabled by config resolution.
+    ram_cache: "HostExpertCache | None" = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -281,6 +288,10 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._bounded_slot_for_id: list[list[int]] = []
+        self._bounded_id_of_slot: list[int] = []
+        self._bounded_usage: list[int] = []
+        self._bounded_step = 0
 
     def set_bank_sources(
         self,
@@ -345,8 +356,81 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+    def set_bounded_host_cache(self, host_cache: "HostExpertCache") -> None:
+        """Attach an FTW row store and allocate the GPU slot cache.
+
+        Bounded host mode has no device-addressable source bank, so it cannot
+        use the captured copy-plan kernels.  The eager path fills one complete
+        GPU slot before publishing its mapping.
+        """
+        if self.prefill_overlap:
+            raise ValueError("bounded MoE RAM cache requires prefill overlap to be disabled")
+        if self.decode_target != "gpu":
+            raise ValueError("bounded MoE RAM cache requires the GPU offload decode target")
+        if host_cache.store.num_layers != self.num_layers or host_cache.store.num_experts != self.num_experts:
+            raise ValueError("bounded host cache geometry does not match the MoE cache")
+        self.ram_cache = host_cache
+        self.bank_schema = tuple(host_cache.bank_schema)
+        self.bank_sources = {}
+        self.bank_caches = {}
+        self.layer_residency = ["nvme"] * self.num_layers
+        self._unpinned_layers = frozenset()
+        for name in self.bank_schema:
+            spec = host_cache.store.bank_specs[name]
+            self.bank_caches[name] = torch.empty(
+                (self.cache_size, *spec.row_shape),
+                dtype=spec.dtype,
+                device=self.device,
+            )
+        self.banks = [([], self.bank_caches[name]) for name in self.bank_schema]
+        self._copy_fused_ok = False
+        self._copy_dst_ptrs = None
+        self._copy_src_ptrs = None
+        self._copy_feat_bytes = None
+        self._reset_bounded_state()
+
+    @property
+    def expert_bytes_per_slot(self) -> int:
+        """Logical bytes occupied by one expert row across all bank tensors."""
+        if self.ram_cache is not None:
+            return self.ram_cache.logical_bytes_per_expert
+        return sum(
+            math.prod(source[0].shape[1:]) * source[0].element_size()
+            for source in self.bank_sources.values()
+        )
+
+    def _reset_bounded_state(self) -> None:
+        if self.ram_cache is None:
+            return
+        self._bounded_slot_for_id = [
+            [-1] * self.num_experts for _ in range(self.num_layers)
+        ]
+        self._bounded_id_of_slot = [-1] * self.cache_size
+        self._bounded_usage = [0] * self.cache_size
+        self._bounded_step = 0
+        self.slot_for_id.fill_(-1)
+        self.id_of_slot.fill_(-1)
+        self.usage.zero_()
+        self.step.zero_()
+
+    def ram_cache_status(self) -> dict | None:
+        return self.ram_cache.status() if self.ram_cache is not None else None
+
+    def rebuild_ram_cache(self, host_budget_bytes: int, *, per_rank_budget_bytes: int) -> None:
+        """Resize the bounded host arena without touching GPU cache geometry."""
+        if self.ram_cache is None:
+            raise ValueError("bounded MoE RAM cache is not enabled")
+        self.ram_cache.resize(
+            per_rank_budget_bytes,
+            host_budget_bytes=host_budget_bytes,
+            requested=host_budget_bytes,
+        )
+        self._reset_bounded_state()
+
 
     def _build_copy_plan(self) -> None:
+        if self.ram_cache is not None:
+            return
         self._build_fused_copy_plan()
         if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
             return
@@ -448,7 +532,9 @@ class OffloadMoeCache:
         cold-start after rebuild. Object identity is preserved so attached layers and
         ``ctx.moe_offload_cache`` stay valid.
         """
-        assert self.bank_sources, "set_bank_sources must run before rebuild"
+        assert self.bank_sources or self.ram_cache is not None, (
+            "set_bank_sources or set_bounded_host_cache must run before rebuild"
+        )
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
@@ -466,18 +552,30 @@ class OffloadMoeCache:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
-        # 3. Reallocate the slot cache from the retained host sources.
-        for name in self.bank_schema:
-            head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
-            )
-        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
-        self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
+        # 3. Reallocate the slot cache from the retained host sources or FTW row schema.
+        if self.ram_cache is not None:
+            for name in self.bank_schema:
+                spec = self.ram_cache.store.bank_specs[name]
+                self.bank_caches[name] = torch.empty(
+                    (cache_size, *spec.row_shape),
+                    dtype=spec.dtype,
+                    device=self.device,
+                )
+            self.banks = [([], self.bank_caches[n]) for n in self.bank_schema]
+        else:
+            for name in self.bank_schema:
+                head = self.bank_sources[name][0]
+                self.bank_caches[name] = torch.empty(
+                    (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
+                )
+            self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+            self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        if self.ram_cache is not None:
+            self._reset_bounded_state()
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -817,14 +915,126 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        from freetoken.moe.offload_kernels import ensure_experts
+    def _bounded_gpu_victim(self) -> int:
+        free = [i for i, flat_id in enumerate(self._bounded_id_of_slot) if flat_id < 0]
+        if free:
+            return free[0]
+        return min(range(self.cache_size), key=lambda i: (self._bounded_usage[i], i))
 
+    def _bounded_install(self, layer_id: int, expert_id: int, slot_id: int) -> None:
+        old_flat = self._bounded_id_of_slot[slot_id]
+        if old_flat >= 0:
+            old_layer, old_expert = divmod(old_flat, self.num_experts)
+            self._bounded_slot_for_id[old_layer][old_expert] = -1
+            self.slot_for_id[old_layer, old_expert] = -1
+        flat_id = layer_id * self.num_experts + expert_id
+        old_slot = self._bounded_slot_for_id[layer_id][expert_id]
+        if old_slot >= 0 and old_slot != slot_id:
+            self._bounded_id_of_slot[old_slot] = -1
+            self.id_of_slot[old_slot] = -1
+        self._bounded_slot_for_id[layer_id][expert_id] = slot_id
+        self._bounded_id_of_slot[slot_id] = flat_id
+        self._bounded_step += 1
+        self._bounded_usage[slot_id] = self._bounded_step
+        self.slot_for_id[layer_id, expert_id] = slot_id
+        self.id_of_slot[slot_id] = flat_id
+        self.usage[slot_id] = self._bounded_step
+
+    def _copy_bounded_handle(self, handle, slot_id: int) -> None:
+        for name in self.bank_schema:
+            self.bank_caches[name][slot_id].copy_(
+                handle.tensors[name], non_blocking=False
+            )
+
+    def _ensure_experts_bounded(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        assert self.ram_cache is not None
+        raw_ids = [int(value) for value in expert_ids.detach().cpu().reshape(-1).tolist()]
+        self.ram_cache.record_accesses(layer_id, raw_ids)
+        unique_ids = list(dict.fromkeys(raw_ids))
+        missing = 0
+        for expert_id in unique_ids:
+            slot_id = self._bounded_slot_for_id[layer_id][expert_id]
+            if slot_id >= 0:
+                self._bounded_step += 1
+                self._bounded_usage[slot_id] = self._bounded_step
+                self.usage[slot_id] = self._bounded_step
+                continue
+            missing += 1
+            handle = self.ram_cache.get(layer_id, expert_id, observe=False)
+            try:
+                slot_id = self._bounded_gpu_victim()
+                self._copy_bounded_handle(handle, slot_id)
+            finally:
+                handle.release()
+            self._bounded_install(layer_id, expert_id, slot_id)
+
+        mapped = [
+            self._bounded_slot_for_id[layer_id][expert_id] for expert_id in raw_ids
+        ]
+        expert_ids.copy_(
+            torch.as_tensor(mapped, dtype=expert_ids.dtype, device=expert_ids.device)
+            .reshape_as(expert_ids)
+        )
+        self.num_indices.zero_()
+        self.num_missing_full.zero_()
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        if self.collect_stats:
+            self.lru_stats[layer_id, Stat.ACTIVE] += len(unique_ids)
+            self.lru_stats[layer_id, Stat.MISS] += missing
+            self.lru_stats[layer_id, Stat.CALLS] += 1
+
+    def _bounded_materialize_layer(self, layer_id: int) -> None:
+        assert self.ram_cache is not None
+        base = layer_id * self.num_experts
+        # Match the GPU materialize kernel: remove every old entry for this
+        # layer, then reserve slots [0, num_experts) for the full prefill row.
+        for slot_id, flat_id in enumerate(self._bounded_id_of_slot):
+            if base <= flat_id < base + self.num_experts:
+                old_layer, old_expert = divmod(flat_id, self.num_experts)
+                self._bounded_id_of_slot[slot_id] = -1
+                self._bounded_slot_for_id[old_layer][old_expert] = -1
+                self.slot_for_id[old_layer, old_expert] = -1
+                self.id_of_slot[slot_id] = -1
+                self.usage[slot_id] = 0
+        for expert_id in range(self.num_experts):
+            self._bounded_slot_for_id[layer_id][expert_id] = -1
+        for slot_id in range(self.num_experts):
+            old_flat = self._bounded_id_of_slot[slot_id]
+            if old_flat >= 0:
+                old_layer, old_expert = divmod(old_flat, self.num_experts)
+                self._bounded_slot_for_id[old_layer][old_expert] = -1
+                self.slot_for_id[old_layer, old_expert] = -1
+            self._bounded_id_of_slot[slot_id] = base + slot_id
+            self._bounded_slot_for_id[layer_id][slot_id] = slot_id
+            self._bounded_step += 1
+            self._bounded_usage[slot_id] = self._bounded_step
+            self.id_of_slot[slot_id] = base + slot_id
+            self.slot_for_id[layer_id, slot_id] = slot_id
+            self.usage[slot_id] = self._bounded_step
+        for expert_id in range(self.num_experts):
+            handle = self.ram_cache.get(
+                layer_id, expert_id, prefill=True, observe=False
+            )
+            try:
+                self._copy_bounded_handle(handle, expert_id)
+            finally:
+                handle.release()
+        self.num_indices.fill_(self.num_experts)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = True
+
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        if self.ram_cache is not None:
+            self._ensure_experts_bounded(layer_id, expert_ids)
+            return
+        from freetoken.moe.offload_kernels import ensure_experts
+
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -839,6 +1049,8 @@ class OffloadMoeCache:
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
+        if self.ram_cache is not None:
+            raise RuntimeError("bounded MoE RAM cache cannot use the hybrid CPU/GPU path")
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
@@ -851,6 +1063,9 @@ class OffloadMoeCache:
         )
 
     def materialize_layer(self, layer_id: int) -> None:
+        if self.ram_cache is not None:
+            self._bounded_materialize_layer(layer_id)
+            return
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
@@ -858,6 +1073,10 @@ class OffloadMoeCache:
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
+        if self.ram_cache is not None:
+            self._reset_bounded_state()
+            self.expert_recency.fill_(-1)
+            return
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
@@ -877,6 +1096,8 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        if self.ram_cache is not None:
+            self.ram_cache.reset_stats()
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -986,6 +1207,8 @@ class OffloadMoeCache:
         }
 
     def copy_missing(self) -> None:
+        if self.ram_cache is not None:
+            return
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"

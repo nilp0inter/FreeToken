@@ -183,17 +183,20 @@ class ShellClient:
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        ram_bytes: int | None = None,
         wait: float = 300.0,
     ) -> dict[str, Any]:
         """Resize cache pools. Every count is in the endpoint's own unit -- slots for moe/mamba,
         pages for kv and for the window pool (whose page is P on DSV4, 1 token on radix-SWA).
-        Untargeted pools are left out of the body entirely, which the server reads as 'keep'."""
+        ``ram_bytes`` is the bounded host-RAM target. Untargeted pools are left out of the body
+        entirely, which the server reads as 'keep'."""
         body: dict[str, Any] = {"timeout": wait}
         for key, value in (
             ("moe_cache_size", moe_cache_size),
             ("num_pages", num_pages),
             ("num_mamba_slots", num_mamba_slots),
             ("num_swa_pages", num_swa_pages),
+            ("ram_bytes", ram_bytes),
         ):
             if value is not None:
                 body[key] = value

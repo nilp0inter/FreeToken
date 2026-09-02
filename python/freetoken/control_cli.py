@@ -20,6 +20,7 @@ CACHE_TARGETS = (
     ("kv_tokens", "kv", "num_pages"),
     ("num_mamba_slots", "mamba", "num_mamba_slots"),
     ("swa_tokens", "swa", "num_swa_pages"),
+    ("ram_bytes", "ram", "ram_bytes"),
 )
 
 
@@ -37,6 +38,35 @@ def parse_count(token: str) -> int:
     value = float(match.group(1)) * multiplier
     if value <= 0 or value != int(value):
         raise ValueError(f"invalid count: {token!r}")
+    return int(value)
+
+
+def parse_bytes(token: str) -> int:
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d+)?)\s*(b|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib)?\s*",
+        token,
+        re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError(f"invalid byte size: {token!r}")
+    multiplier = {
+        "b": 1,
+        "k": 1 << 10,
+        "kb": 1 << 10,
+        "kib": 1 << 10,
+        "m": 1 << 20,
+        "mb": 1 << 20,
+        "mib": 1 << 20,
+        "g": 1 << 30,
+        "gb": 1 << 30,
+        "gib": 1 << 30,
+        "t": 1 << 40,
+        "tb": 1 << 40,
+        "tib": 1 << 40,
+    }.get((match.group(2) or "b").lower(), 1)
+    value = float(match.group(1)) * multiplier
+    if value <= 0 or value != int(value):
+        raise ValueError(f"invalid byte size: {token!r}")
     return int(value)
 
 
@@ -217,14 +247,6 @@ def _format_stats(doc: dict[str, Any]) -> str:
         ),
         f"vram_bytes={doc.get('vram_bytes', 0)}",
     ]
-    kv = doc.get("kv")
-    if isinstance(kv, dict):
-        lines.append(
-            f"kv={kv.get('used_pages', 0)}/{kv.get('total_pages', 0)} pages "
-            f"page_size={kv.get('page_size', 0)}"
-        )
-    else:
-        lines.append("kv=none")
     mamba = doc.get("mamba")
     if isinstance(mamba, dict):
         lines.append(f"mamba={mamba.get('used_slots', 0)}/{mamba.get('total_slots', 0)} slots")
@@ -252,6 +274,7 @@ def _format_rebuild(doc: dict[str, Any]) -> str:
         f"kv={doc.get('num_pages', 'unknown')}",
         f"mamba={doc.get('mamba_slots', 'unknown')}",
         f"swa={doc.get('num_swa_pages', 'unknown')}",
+        f"ram={doc.get('ram_bytes', 'unknown')}",
     ]
     if doc.get("error"):
         parts.append(f"error={doc['error']}")
@@ -333,6 +356,12 @@ def _add_rebuild_args(parser: argparse.ArgumentParser) -> None:
         type=parse_count,
         dest="swa_tokens",
         help="Window (SWA) pool size in TOKENS, rounded up to its page size (k=1024, m=1024*1024)",
+    )
+    parser.add_argument(
+        "--ram",
+        type=parse_bytes,
+        dest="ram_bytes",
+        help="Host-wide bounded MoE RAM in bytes (K/M/G/T use powers of 1024)",
     )
     parser.add_argument(
         "--wait",
@@ -427,6 +456,9 @@ def _rebuild_body(targets: dict[str, int], geometry: dict[str, Any]) -> dict[str
                 f"(it has: {', '.join(pools.targets)})",
                 exit_code=2,
             )
+        if pool == "ram":
+            body["ram_bytes"] = value
+            continue
         if pool == "kv":
             body["num_pages"] = pages_for_tokens(value, page_size)
         elif pool == "swa":

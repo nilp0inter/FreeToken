@@ -154,12 +154,13 @@ class Scheduler(SchedulerIOMixin):
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        ram_bytes: int | None = None,
     ) -> None:
         """Idle-only runtime cache rebuild: resize the MoE slot cache, KV pages, GDN (mamba) state
-        pool, and/or the window pool (num_swa_pages), re-capture CUDA graphs, and re-thread the
-        page managers (clearing the prefix cache on a KV/mamba/window resize). The caller MUST
-        guarantee the scheduler is idle — no pending prefill, no running decode, no in-flight
-        finished requests. All TP ranks must call this with identical arguments.
+        pool, window pool, and bounded host-RAM expert arena. GPU pool changes re-capture CUDA
+        graphs. A RAM-only change updates the eager FTW row cache. The caller MUST guarantee the
+        scheduler is idle -- no pending prefill, no running decode, no in-flight finished
+        requests. All TP ranks must call this with identical arguments.
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
@@ -168,7 +169,7 @@ class Scheduler(SchedulerIOMixin):
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
-            num_swa_pages=num_swa_pages,
+            num_swa_pages=num_swa_pages, ram_bytes=ram_bytes,
         )
         if num_pages is not None or num_mamba_slots is not None or num_swa_pages is not None:
             # Any of these resizes invalidates the prefix cache: a KV resize leaves stale page
@@ -622,6 +623,8 @@ class Scheduler(SchedulerIOMixin):
                     num_pages=geo["num_pages"],
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
+                    ram_bytes=geo["ram_bytes"] or 0,
+                    ram_cache=geo["ram_cache"],
                     error=error,
                 )
             ]
@@ -638,6 +641,7 @@ class Scheduler(SchedulerIOMixin):
             "num_pages": msg.num_pages,
             "num_mamba_slots": msg.num_mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
+            "ram_bytes": msg.ram_bytes,
         }
         # Rollback target: the CURRENT (serving) sizes of ONLY the pools this request touches.
         # Passing the untouched pools too would trip rebuild_cache's KV/mamba/SWA gate and wipe
@@ -717,11 +721,27 @@ class Scheduler(SchedulerIOMixin):
             getattr(config, "cache_type", None) == "swa_radix"
         ):  # usable window tokens = pool tokens minus the slot-0 sentinel
             num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        ram_cache = (
+            eng.moe_offload_cache.ram_cache_status()
+            if eng.moe_offload_cache is not None
+            else None
+        )
         return dict(
             num_pages=eng.num_pages,
-            moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
-            num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
+            moe_cache_size=(
+                eng.moe_offload_cache.cache_size
+                if eng.moe_offload_cache is not None else None
+            ),
+            num_mamba_slots=(
+                eng.linear_state_pool.num_slots - 1
+                if eng.linear_state_pool is not None else None
+            ),
             num_swa_pages=num_swa_pages,
+            ram_bytes=(
+                int(ram_cache.get("requested_bytes", 0))
+                if isinstance(ram_cache, dict) else None
+            ),
+            ram_cache=ram_cache,
         )
 
     def _log_cache_geometry(self, event: str) -> None:
@@ -755,6 +775,12 @@ class Scheduler(SchedulerIOMixin):
                     f"MoE cache {moe.cache_size}/{moe.num_layers * moe.num_experts}"
                     f" ({_gib(moe.cache_size * unit['moe_bytes_per_expert'])})"
                 )
+                ram_cache = moe.ram_cache_status()
+                if ram_cache is not None:
+                    parts.append(
+                        f"MoE RAM {_gib(ram_cache['requested_bytes'])} requested"
+                        f"/{_gib(ram_cache['allocated_bytes'])} allocated"
+                    )
             logger.info_rank0(f"{event}: " + ", ".join(parts))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")

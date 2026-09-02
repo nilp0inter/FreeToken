@@ -341,6 +341,54 @@ class FTWReader:
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(rd, jobs))
 
+    def read_range_into(
+        self,
+        dest: memoryview,
+        global_off: int,
+        nbytes: int,
+        *,
+        workers: int = 1,
+        chunk: int = _DEFAULT_CHUNK,
+    ) -> None:
+        """Read an arbitrary byte range, including an unaligned expert row.
+
+        O_DIRECT requires aligned offsets, lengths, and buffers.  FTW tensor
+        starts and padding are aligned, so an unaligned row is read through a
+        transient aligned buffer and copied into the exact destination range.
+        """
+        if global_off < 0 or nbytes < 0 or len(dest) < nbytes:
+            raise ValueError("invalid FTW byte range or destination")
+        if nbytes == 0:
+            return
+        start = global_off // ALIGN * ALIGN
+        end = _align_up(global_off + nbytes)
+        window = end - start
+        offset = global_off - start
+        if offset == 0 and window <= len(dest):
+            self.read_into(dest[:window], {"global_off": start, "nbytes": window},
+                           workers=workers, chunk=chunk)
+            return
+        scratch = _transient_buffer(window)
+        try:
+            self.read_into(memoryview(scratch), {"global_off": start, "nbytes": window},
+                           workers=workers, chunk=chunk)
+            dest[:nbytes] = memoryview(scratch)[offset:offset + nbytes]
+        finally:
+            scratch.close()
+
+    def read_tensor(self, entry: dict) -> torch.Tensor:
+        """Read one indexed tensor into an independent CPU tensor."""
+        dtype = _dtype_of(entry["dtype"])
+        shape = tuple(int(v) for v in entry["shape"])
+        scratch = _transient_buffer(entry["nbytes"])
+        try:
+            self.read_into(memoryview(scratch), entry)
+            view = torch.frombuffer(scratch, dtype=dtype, count=math.prod(shape))
+            result = view.reshape(shape).clone()
+            del view
+            return result
+        finally:
+            scratch.close()
 
 def _transient_buffer(nbytes: int) -> mmap.mmap:
     return mmap.mmap(-1, _align_up(nbytes))

@@ -24,8 +24,9 @@ for them; other checkpoints of the same architectures work too.
 `ft serve --moe-backend {auto,fused,offload,cpu,hybrid}`:
 
 - **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
-- **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
-  misses stream over PCIe.
+- **offload** — experts use host RAM, with an LRU cache of expert slots on GPU.
+  Misses stream over PCIe. Use `--moe-ram-cache-size <size>` to bound host
+  RAM and load cold rows from an FTW checkpoint on NVMe.
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
