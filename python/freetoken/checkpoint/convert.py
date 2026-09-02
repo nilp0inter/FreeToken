@@ -220,12 +220,11 @@ def convert_checkpoint(
     quant_format = None
     num_layers = None
     if offload:
-        # Streamable formats (bf16, ds_fp4, nvfp4 on the triton backend, gpt-oss mxfp4, q4_0,
-        # qwen3_5 fp8/bf16-dequant) write each layer to its own FTW entry as it completes (via
-        # the sink) instead of materializing the whole bank set first; the non-streamable ones
-        # (nvfp4 marlin/b12x -- repack mutates the whole bank set in place after load) ignore
-        # the sink. Which happened is per-provider (e.g. nvfp4's backend pick), so it's read
-        # back from ExpertBanks.streamed, not guessed here.
+        # Streamable formats (bf16, ds_fp4, nvfp4, gpt-oss mxfp4, q4_0, qwen3_5 fp8/bf16-dequant)
+        # write each layer to its own FTW entry as it completes. NVFP4 marlin/b12x repack
+        # through a per-layer sink, and the native source loader allocates only one layer
+        # at a time while that sink is active. Which path happened is reported by
+        # ExpertBanks.streamed, not guessed here.
         sink = _ConvertSink(writer)
         banks = load_expert_banks(model_path, mc, device=dev, dtype=dtype, layer_sink=sink)
         quant_format = banks.quant_format
