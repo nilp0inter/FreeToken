@@ -292,6 +292,7 @@ class OffloadMoeCache:
         self._bounded_id_of_slot: list[int] = []
         self._bounded_usage: list[int] = []
         self._bounded_step = 0
+        self._bounded_staging_copy_event: torch.cuda.Event | None = None
 
     def set_bank_sources(
         self,
@@ -387,6 +388,8 @@ class OffloadMoeCache:
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        if self.device.type == "cuda":
+            self._bounded_staging_copy_event = torch.cuda.Event()
         self._reset_bounded_state()
 
     @property
@@ -940,10 +943,10 @@ class OffloadMoeCache:
         self.id_of_slot[slot_id] = flat_id
         self.usage[slot_id] = self._bounded_step
 
-    def _copy_bounded_handle(self, handle, slot_id: int) -> None:
+    def _copy_bounded_handle(self, handle, slot_id: int, *, non_blocking: bool = False) -> None:
         for name in self.bank_schema:
             self.bank_caches[name][slot_id].copy_(
-                handle.tensors[name], non_blocking=False
+                handle.tensors[name], non_blocking=non_blocking
             )
 
     def _ensure_experts_bounded(self, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -951,22 +954,49 @@ class OffloadMoeCache:
         raw_ids = [int(value) for value in expert_ids.detach().cpu().reshape(-1).tolist()]
         self.ram_cache.record_accesses(layer_id, raw_ids)
         unique_ids = list(dict.fromkeys(raw_ids))
-        missing = 0
-        for expert_id in unique_ids:
-            slot_id = self._bounded_slot_for_id[layer_id][expert_id]
-            if slot_id >= 0:
-                self._bounded_step += 1
-                self._bounded_usage[slot_id] = self._bounded_step
-                self.usage[slot_id] = self._bounded_step
-                continue
-            missing += 1
-            handle = self.ram_cache.get(layer_id, expert_id, observe=False)
-            try:
+        missing_ids = [
+            expert_id
+            for expert_id in unique_ids
+            if self._bounded_slot_for_id[layer_id][expert_id] < 0
+        ]
+        missing = len(missing_ids)
+        handles, bypass_ids = self.ram_cache.get_many(
+            layer_id,
+            missing_ids,
+            observe=False,
+        )
+        bypass_set = set(bypass_ids)
+        in_flight = list(handles.values())
+        try:
+            for expert_id in unique_ids:
+                slot_id = self._bounded_slot_for_id[layer_id][expert_id]
+                if slot_id >= 0:
+                    self._bounded_step += 1
+                    self._bounded_usage[slot_id] = self._bounded_step
+                    self.usage[slot_id] = self._bounded_step
+                    continue
                 slot_id = self._bounded_gpu_victim()
-                self._copy_bounded_handle(handle, slot_id)
-            finally:
-                handle.release()
-            self._bounded_install(layer_id, expert_id, slot_id)
+                handle = handles.get(expert_id)
+                if handle is not None:
+                    self._copy_bounded_handle(
+                        handle,
+                        slot_id,
+                        non_blocking=self.device.type == "cuda",
+                    )
+                else:
+                    assert expert_id in bypass_set
+                    handle = self.ram_cache.get(layer_id, expert_id, observe=False)
+                    try:
+                        self._copy_bounded_handle(handle, slot_id)
+                    finally:
+                        handle.release()
+                self._bounded_install(layer_id, expert_id, slot_id)
+        finally:
+            if in_flight:
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).synchronize()
+                for handle in in_flight:
+                    self.ram_cache.release_in_flight(handle)
 
         mapped = [
             self._bounded_slot_for_id[layer_id][expert_id] for expert_id in raw_ids
@@ -1012,14 +1042,25 @@ class OffloadMoeCache:
             self.id_of_slot[slot_id] = base + slot_id
             self.slot_for_id[layer_id, slot_id] = slot_id
             self.usage[slot_id] = self._bounded_step
-        for expert_id in range(self.num_experts):
-            handle = self.ram_cache.get(
-                layer_id, expert_id, prefill=True, observe=False
-            )
-            try:
-                self._copy_bounded_handle(handle, expert_id)
-            finally:
-                handle.release()
+        if self.ram_cache.has_layer_staging:
+            if self._bounded_staging_copy_event is not None:
+                self._bounded_staging_copy_event.synchronize()
+            staging = self.ram_cache.load_layer(layer_id)
+            non_blocking = self.device.type == "cuda"
+            for name in self.bank_schema:
+                self.bank_caches[name][: self.num_experts].copy_(
+                    staging[name],
+                    non_blocking=non_blocking,
+                )
+            if self._bounded_staging_copy_event is not None:
+                self._bounded_staging_copy_event.record(torch.cuda.current_stream(self.device))
+        else:
+            for expert_id in range(self.num_experts):
+                handle = self.ram_cache.get(layer_id, expert_id, prefill=True)
+                try:
+                    self._copy_bounded_handle(handle, expert_id)
+                finally:
+                    handle.release()
         self.num_indices.fill_(self.num_experts)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True

@@ -9,6 +9,8 @@ mapping becomes visible.
 
 from __future__ import annotations
 
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import math
 import os
@@ -267,6 +269,10 @@ class NvmeExpertStore:
         self.logical_bytes_per_expert = sum(spec.row_bytes for spec in self.bank_specs.values())
         self.slot_storage_bytes = sum(_align_up(spec.row_bytes) for spec in self.bank_specs.values())
         self.total_expert_bytes = self.num_layers * self.num_experts * self.logical_bytes_per_expert
+        self.layer_storage_bytes = sum(
+            _align_up(spec.row_bytes * self.num_experts)
+            for spec in self.bank_specs.values()
+        )
 
     def _check_entry(self, name: str, entry: dict, expected_rows: int) -> BankSpec:
         shape = tuple(int(v) for v in entry["shape"])
@@ -332,6 +338,31 @@ class NvmeExpertStore:
         for name in self.bank_schema:
             offset, nbytes = self._locations[name][layer_id][expert_id]
             self.reader.read_range_into(destinations[name].memoryview(), offset, nbytes)
+            disk_bytes += nbytes
+        return disk_bytes
+
+    def read_layer(
+        self,
+        layer_id: int,
+        destinations: dict[str, HostBank],
+        *,
+        workers: int = 8,
+    ) -> int:
+        """Read one complete expert layer with parallel, contiguous bank reads."""
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError(f"layer_id {layer_id} out of range [0, {self.num_layers})")
+        if set(destinations) != set(self.bank_schema):
+            raise ValueError("layer destination banks do not match the FTW bank schema")
+        disk_bytes = 0
+        for name in self.bank_schema:
+            offset, _ = self._locations[name][layer_id][0]
+            nbytes = self.bank_specs[name].row_bytes * self.num_experts
+            self.reader.read_range_into(
+                destinations[name].memoryview(),
+                offset,
+                nbytes,
+                workers=workers,
+            )
             disk_bytes += nbytes
         return disk_bytes
 
@@ -409,14 +440,22 @@ class HostExpertCache:
         self.requested = requested
         self.tp_size = max(1, tp_size)
         self.slot_storage_bytes = store.slot_storage_bytes
-        self.workspace_bytes = store.slot_storage_bytes
-        self.minimum_bytes = self.slot_storage_bytes + self.workspace_bytes
+        can_stage_layer = (
+            self.per_rank_budget_bytes
+            >= store.layer_storage_bytes + self.slot_storage_bytes * 2
+        )
+        self.layer_workspace_bytes = store.layer_storage_bytes if can_stage_layer else 0
+        self.workspace_bytes = self.slot_storage_bytes + self.layer_workspace_bytes
+        self.minimum_bytes = self.workspace_bytes + self.slot_storage_bytes
         self._pin = torch.cuda.is_available() if pin is None else bool(pin)
         self._backing = "cuda" if self._pin else "mmap"
         self._lock = threading.RLock()
         self._frequency: dict[tuple[int, int], int] = {}
         self._map: dict[tuple[int, int], int] = {}
         self._clock = 0
+        self._free_slots: deque[int] = deque()
+        self._probation: OrderedDict[int, None] = OrderedDict()
+        self._protected: OrderedDict[int, None] = OrderedDict()
         self._protected_limit = 1
         self._bypass_busy = False
         self._bypass_generation = 0
@@ -430,8 +469,21 @@ class HostExpertCache:
         self._slots: list[_Slot] = []
         self._bypass: _Slot | None = None
         capacity = self._capacity_for_budget(self.per_rank_budget_bytes)
+        self._io_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ft-moe-io")
         try:
             self._slots = [self._new_slot() for _ in range(capacity)]
+            self._layer_staging = (
+                {
+                    name: HostBank(
+                        (self.store.num_experts, *self.store.bank_specs[name].row_shape),
+                        self.store.bank_specs[name].dtype,
+                        backing=self._backing,
+                    )
+                    for name in self.bank_schema
+                }
+                if self.layer_workspace_bytes
+                else {}
+            )
             self._bypass = self._new_slot()
         except Exception as exc:
             self.close()
@@ -439,7 +491,7 @@ class HostExpertCache:
                 f"cannot allocate {self.allocated_bytes_for_capacity(capacity)} B "
                 f"for the bounded MoE RAM cache"
             ) from exc
-        self._protected_limit = max(1, int(capacity * 0.8))
+        self._capacity_reset()
 
     @classmethod
     def from_request(
@@ -472,6 +524,10 @@ class HostExpertCache:
     @property
     def capacity(self) -> int:
         return len(self._slots)
+
+    @property
+    def has_layer_staging(self) -> bool:
+        return bool(self._layer_staging)
 
     @property
     def logical_bytes_per_expert(self) -> int:
@@ -513,7 +569,7 @@ class HostExpertCache:
         self._frequency[key] = min(_MAX_FREQUENCY, self._frequency.get(key, 0) + 1)
 
     def record_accesses(self, layer_id: int, expert_ids: Iterable[int]) -> None:
-        """Record routed accesses without loading or admitting experts."""
+        """Record routed accesses and keep RAM copies of GPU hits recent."""
         layer_id = int(layer_id)
         if not 0 <= layer_id < self.store.num_layers:
             raise ValueError(f"layer_id {layer_id} out of range")
@@ -521,44 +577,43 @@ class HostExpertCache:
             for expert_id in expert_ids:
                 if not 0 <= int(expert_id) < self.store.num_experts:
                     raise ValueError(f"expert_id {expert_id} out of range")
-                self._record_access((layer_id, int(expert_id)))
+                key = (layer_id, int(expert_id))
+                self._record_access(key)
+                slot_id = self._map.get(key)
+                if slot_id is not None and self._slots[slot_id].state is SlotState.READY:
+                    self._touch(slot_id)
 
     def _touch(self, slot_id: int) -> None:
         slot = self._slots[slot_id]
         self._clock += 1
         slot.last_used = self._clock
-        if slot.segment == "probation":
-            slot.segment = "protected"
-            protected = [
-                s for s in self._slots
-                if s.state is SlotState.READY and s.segment == "protected"
-            ]
-            if len(protected) > self._protected_limit:
-                demote = min(protected, key=lambda s: s.last_used)
-                demote.segment = "probation"
+        if slot.segment == "protected":
+            self._protected[slot_id] = None
+            self._protected.move_to_end(slot_id)
+            return
+        self._probation.pop(slot_id, None)
+        slot.segment = "protected"
+        self._protected[slot_id] = None
+        if len(self._protected) > self._protected_limit:
+            demote_id, _ = self._protected.popitem(last=False)
+            self._slots[demote_id].segment = "probation"
+            self._probation[demote_id] = None
 
     def _victim(self) -> int | None:
-        free = [i for i, slot in enumerate(self._slots) if slot.state is SlotState.FREE]
-        if free:
-            return free[0]
-        probation = [
-            (i, slot) for i, slot in enumerate(self._slots)
-            if slot.state is SlotState.READY and slot.segment == "probation"
-        ]
-        if not probation:
-            protected = [
-                slot for slot in self._slots
-                if slot.state is SlotState.READY and slot.segment == "protected"
-            ]
-            if not protected:
-                return None
-            demote = min(protected, key=lambda s: s.last_used)
-            demote.segment = "probation"
-            probation = [
-                (i, slot) for i, slot in enumerate(self._slots)
-                if slot.state is SlotState.READY and slot.segment == "probation"
-            ]
-        return min(probation, key=lambda item: item[1].last_used)[0]
+        if self._free_slots:
+            return self._free_slots[0]
+        if self._probation:
+            return next(iter(self._probation))
+        if self._protected:
+            return next(iter(self._protected))
+        return None
+
+    def _claim_victim(self, slot_id: int) -> None:
+        if self._free_slots and self._free_slots[0] == slot_id:
+            self._free_slots.popleft()
+        else:
+            self._probation.pop(slot_id, None)
+            self._protected.pop(slot_id, None)
 
     def _load(self, slot: _Slot, layer_id: int, expert_id: int) -> None:
         started = time.perf_counter_ns()
@@ -660,6 +715,7 @@ class HostExpertCache:
 
             if victim is None:
                 raise RuntimeError("bounded MoE RAM cache has no eviction victim")
+            self._claim_victim(victim_id)
             if victim.key is not None:
                 self._map.pop(victim.key, None)
                 self._evictions += 1
@@ -671,11 +727,141 @@ class HostExpertCache:
             except Exception:
                 victim.key = None
                 victim.state = SlotState.FREE
+                self._free_slots.appendleft(victim_id)
                 raise
             victim.state = SlotState.READY
             self._map[key] = victim_id
             self._touch(victim_id)
             return self._handle_for_slot(victim_id)
+
+    def get_many(
+        self,
+        layer_id: int,
+        expert_ids: Iterable[int],
+        *,
+        observe: bool = True,
+    ) -> tuple[dict[int, HostExpertHandle], list[int]]:
+        """Load persistent-cache candidates concurrently.
+
+        Returned handles are already IN_FLIGHT. Expert IDs that admission sends
+        through the single bypass workspace are returned separately.
+        """
+        layer_id = int(layer_id)
+        ids = list(dict.fromkeys(int(expert_id) for expert_id in expert_ids))
+        handles: dict[int, HostExpertHandle] = {}
+        bypass_ids: list[int] = []
+        reserved: list[tuple[int, int]] = []
+        with self._lock:
+            if not 0 <= layer_id < self.store.num_layers:
+                raise ValueError(f"layer_id {layer_id} out of range")
+            for expert_id in ids:
+                if not 0 <= expert_id < self.store.num_experts:
+                    raise ValueError(f"expert_id {expert_id} out of range")
+                key = (layer_id, expert_id)
+                if observe:
+                    self._record_access(key)
+                slot_id = self._map.get(key)
+                if slot_id is not None and self._slots[slot_id].state is SlotState.READY:
+                    self._hits += 1
+                    handle = self._handle_for_slot(slot_id)
+                    self._probation.pop(slot_id, None)
+                    self._protected.pop(slot_id, None)
+                    self._slots[slot_id].state = SlotState.IN_FLIGHT
+                    handles[expert_id] = handle
+                    continue
+
+                victim_id = self._victim()
+                victim = self._slots[victim_id] if victim_id is not None else None
+                if (
+                    victim is None
+                    or (
+                        victim.key is not None
+                        and self._frequency.get(key, 0)
+                        < self._frequency.get(victim.key, 0)
+                    )
+                ):
+                    bypass_ids.append(expert_id)
+                    continue
+                assert victim_id is not None
+                self._misses += 1
+
+                self._claim_victim(victim_id)
+                if victim.key is not None:
+                    self._map.pop(victim.key, None)
+                    self._evictions += 1
+                victim.generation += 1
+                victim.key = key
+                victim.segment = "probation"
+                victim.state = SlotState.LOADING
+                reserved.append((expert_id, victim_id))
+
+        def load_one(item: tuple[int, int]) -> tuple[int, int, int]:
+            expert_id, slot_id = item
+            started = time.perf_counter_ns()
+            disk_bytes = self.store.read_expert(
+                layer_id,
+                expert_id,
+                self._slots[slot_id].banks,
+            )
+            return expert_id, disk_bytes, time.perf_counter_ns() - started
+
+        io_pool = self._io_pool
+        assert io_pool is not None
+        futures = [io_pool.submit(load_one, item) for item in reserved]
+        try:
+            loaded = [future.result() for future in futures]
+        except Exception:
+            for future in futures:
+                future.cancel()
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+            with self._lock:
+                for expert_id, slot_id in reserved:
+                    slot = self._slots[slot_id]
+                    slot.key = None
+                    slot.state = SlotState.FREE
+                    self._free_slots.append(slot_id)
+                for handle in handles.values():
+                    self.release_in_flight(handle)
+            raise
+
+        loaded_stats = {expert_id: (disk_bytes, elapsed) for expert_id, disk_bytes, elapsed in loaded}
+        with self._lock:
+            for expert_id, slot_id in reserved:
+                slot = self._slots[slot_id]
+                disk_bytes, elapsed = loaded_stats[expert_id]
+                self._disk_bytes += disk_bytes
+                self._disk_reads += 1
+                self._disk_latency_ns += elapsed
+                slot.state = SlotState.IN_FLIGHT
+                self._map[(layer_id, expert_id)] = slot_id
+                handles[expert_id] = HostExpertHandle(
+                    self,
+                    {name: slot.banks[name].tensor[0] for name in self.bank_schema},
+                    slot_id,
+                    slot.generation,
+                    False,
+                )
+        return handles, bypass_ids
+
+
+    def load_layer(self, layer_id: int) -> dict[str, torch.Tensor]:
+        """Load a full layer into the fixed pinned staging workspace."""
+        if not self._layer_staging:
+            raise RuntimeError("RAM cache budget has no complete-layer staging workspace")
+        with self._lock:
+            started = time.perf_counter_ns()
+            disk_bytes = self.store.read_layer(layer_id, self._layer_staging)
+            self._disk_bytes += disk_bytes
+            self._disk_reads += self.store.num_experts
+            self._disk_latency_ns += time.perf_counter_ns() - started
+            return {
+                name: self._layer_staging[name].tensor
+                for name in self.bank_schema
+            }
 
     def mark_in_flight(self, handle: HostExpertHandle) -> None:
         """Protect a persistent slot during an asynchronous consumer operation."""
@@ -685,6 +871,8 @@ class HostExpertCache:
             slot = self._slots[handle.slot_id]
             if slot.generation != handle.generation or slot.state is not SlotState.READY:
                 raise RuntimeError("stale bounded MoE RAM cache handle")
+            self._probation.pop(handle.slot_id, None)
+            self._protected.pop(handle.slot_id, None)
             slot.state = SlotState.IN_FLIGHT
 
     def release_in_flight(self, handle: HostExpertHandle) -> None:
@@ -695,6 +883,10 @@ class HostExpertCache:
             if slot.generation != handle.generation or slot.state is not SlotState.IN_FLIGHT:
                 raise RuntimeError("stale bounded MoE RAM cache handle")
             slot.state = SlotState.READY
+            if slot.segment == "protected":
+                self._protected[handle.slot_id] = None
+            else:
+                self._probation[handle.slot_id] = None
 
     def reset_stats(self) -> None:
         with self._lock:
@@ -756,6 +948,9 @@ class HostExpertCache:
     def _capacity_reset(self) -> None:
         self._map.clear()
         self._frequency.clear()
+        self._free_slots = deque(range(len(self._slots)))
+        self._probation.clear()
+        self._protected.clear()
         for slot in self._slots:
             slot.state = SlotState.FREE
             slot.key = None
@@ -792,6 +987,10 @@ class HostExpertCache:
             }
 
     def close(self) -> None:
+        io_pool = getattr(self, "_io_pool", None)
+        if io_pool is not None:
+            io_pool.shutdown(wait=True)
+            self._io_pool = None
         with getattr(self, "_lock", threading.RLock()):
             slots = getattr(self, "_slots", [])
             for slot in slots:
@@ -799,8 +998,12 @@ class HostExpertCache:
             bypass = getattr(self, "_bypass", None)
             if bypass is not None:
                 self._release_slot_memory(bypass)
+            layer_staging = getattr(self, "_layer_staging", {})
+            for bank in layer_staging.values():
+                bank.release()
             self._slots = []
             self._bypass = None
+            self._layer_staging = {}
             self._map = {}
             store = getattr(self, "store", None)
             if store is not None:
