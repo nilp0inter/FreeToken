@@ -217,8 +217,23 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
             f"evictions={_int(ram, 'evictions')}, "
             f"disk={format_bytes(_int(ram, 'disk_bytes'))}"
         )
+    controller_line = None
+    if isinstance(ram, dict):
+        controller = ram.get("controller")
+        if isinstance(controller, dict):
+            limits = controller.get("limits") or {}
+            controller_line = (
+                "  controller "
+                f"{'on' if controller.get('enabled') else 'off'}, "
+                f"prefetch={_int(limits, 'prefetch_experts')} experts, "
+                f"microbatch={_int(limits, 'microbatch_tokens')} tokens, "
+                f"static_graphs={'yes' if controller.get('static_graph_slots') else 'no'}"
+            )
+    extras = [
+        line for line in (ram_line, controller_line) if line is not None
+    ]
     if not rows:
-        return "\n".join([header] + ([ram_line] if ram_line else []))
+        return "\n".join([header, *extras])
 
     with_vram = bool(known)
     with_range = any(resize for _pool, _detail, _size, resize in rows)
@@ -241,6 +256,5 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
             for row in table
         ],
     ]
-    if ram_line:
-        table_lines.append(ram_line)
+    table_lines.extend(extras)
     return "\n".join(table_lines)

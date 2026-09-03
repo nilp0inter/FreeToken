@@ -155,6 +155,8 @@ class Scheduler(SchedulerIOMixin):
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
         ram_bytes: int | None = None,
+        controller_enabled: bool | None = None,
+        controller_limits: dict[str, int] | None = None,
     ) -> None:
         """Idle-only runtime cache rebuild: resize the MoE slot cache, KV pages, GDN (mamba) state
         pool, window pool, and bounded host-RAM expert arena. GPU pool changes re-capture CUDA
@@ -168,8 +170,13 @@ class Scheduler(SchedulerIOMixin):
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
-            moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
-            num_swa_pages=num_swa_pages, ram_bytes=ram_bytes,
+            moe_cache_size=moe_cache_size,
+            num_pages=num_pages,
+            num_mamba_slots=num_mamba_slots,
+            num_swa_pages=num_swa_pages,
+            ram_bytes=ram_bytes,
+            controller_enabled=controller_enabled,
+            controller_limits=controller_limits,
         )
         if num_pages is not None or num_mamba_slots is not None or num_swa_pages is not None:
             # Any of these resizes invalidates the prefix cache: a KV resize leaves stale page
@@ -398,6 +405,24 @@ class Scheduler(SchedulerIOMixin):
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
+            ram_status = None
+            if any(m.finished for m in reply):
+                moe_cache = self.engine.moe_offload_cache
+                if moe_cache is not None:
+                    full_status = moe_cache.ram_cache_status()
+                    if full_status is not None:
+                        def strip_addresses(value):
+                            if isinstance(value, dict):
+                                return {
+                                    key: strip_addresses(item)
+                                    for key, item in value.items()
+                                    if key != "addresses"
+                                }
+                            if isinstance(value, list):
+                                return [strip_addresses(item) for item in value]
+                            return value
+
+                        ram_status = strip_addresses(full_status)
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -406,6 +431,8 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                if m.finished:
+                    m.ram_cache = ram_status
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -642,6 +669,8 @@ class Scheduler(SchedulerIOMixin):
             "num_mamba_slots": msg.num_mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
             "ram_bytes": msg.ram_bytes,
+            "controller_enabled": msg.controller_enabled,
+            "controller_limits": msg.controller_limits,
         }
         # Rollback target: the CURRENT (serving) sizes of ONLY the pools this request touches.
         # Passing the untouched pools too would trip rebuild_cache's KV/mamba/SWA gate and wipe
@@ -742,6 +771,16 @@ class Scheduler(SchedulerIOMixin):
                 if isinstance(ram_cache, dict) else None
             ),
             ram_cache=ram_cache,
+            controller_enabled=(
+                ram_cache.get("controller", {}).get("enabled")
+                if isinstance(ram_cache, dict)
+                else None
+            ),
+            controller_limits=(
+                ram_cache.get("controller", {}).get("limits")
+                if isinstance(ram_cache, dict)
+                else None
+            ),
         )
 
     def _log_cache_geometry(self, event: str) -> None:

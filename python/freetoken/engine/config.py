@@ -38,6 +38,9 @@ class EngineConfig:
     moe_ram_cache_size: int | str | None = None
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
+    moe_cache_controller: bool = True
+    moe_prefetch_experts: int = 16
+    moe_prefill_microbatch_tokens: int = 256
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8

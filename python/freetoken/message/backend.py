@@ -53,4 +53,6 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     ram_bytes: int | None = None
+    controller_enabled: bool | None = None
+    controller_limits: dict[str, int] | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)

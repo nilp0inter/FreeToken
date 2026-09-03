@@ -88,7 +88,8 @@ def _apply_think_command(
 
 
 def _cache_targets_hint(pools: CachePools) -> str:
-    return " | ".join(f"{name} <N>" for name in pools.targets)
+    targets = [*pools.targets, "controller", "prefetch", "microbatch"]
+    return " | ".join(f"{name} <N>" for name in targets)
 
 
 _CACHE_EXAMPLES = {"moe": "4k", "kv": "128k", "mamba": "64", "swa": "32k", "ram": "64G"}
@@ -121,6 +122,7 @@ def _cache_usage(pools: CachePools) -> str:
         f"Usage: /cache [status | {_cache_targets_hint(pools)}]; combine targets, e.g. "
         f"/cache {example}. " + "; ".join(clauses) + ". "
         "N accepts a k/m suffix (k=1024, m=1024^2)."
+        " Controller accepts on/off; prefetch and microbatch accept counts."
     )
 
 
@@ -179,6 +181,9 @@ class CacheCommand:
     mamba: int | None = None
     swa_tokens: int | None = None
     ram_bytes: int | None = None
+    controller_enabled: bool | None = None
+    prefetch_experts: int | None = None
+    microbatch_tokens: int | None = None
     error: str | None = None
 
 
@@ -201,10 +206,11 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
     for a in args:
         tokens.extend(a.split("=", 1) if "=" in a else [a])
     values: dict[str, int] = {}
+    controller_enabled: bool | None = None
     i = 0
     while i < len(tokens):
         key = tokens[i].lower()
-        if key not in pools.targets:
+        if key not in (*pools.targets, "controller", "prefetch", "microbatch"):
             known = (
                 f"This model has no {key} pool. "
                 if key in CACHE_UNITS
@@ -213,7 +219,20 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
             return _cache_error(known + usage)
         if i + 1 >= len(tokens):
             return _cache_error(f"Missing value for {key!r}. {usage}")
-        val = _parse_bytes(tokens[i + 1]) if key == "ram" else _parse_count(tokens[i + 1])
+        if key == "controller":
+            switch = tokens[i + 1].lower()
+            if switch not in ("on", "off"):
+                return _cache_error(
+                    f"'controller' expects on or off, got {tokens[i + 1]!r}"
+                )
+            controller_enabled = switch == "on"
+            i += 2
+            continue
+        val = (
+            _parse_bytes(tokens[i + 1])
+            if key == "ram"
+            else _parse_count(tokens[i + 1])
+        )
         if val is None:
             expected = "positive bytes (e.g. 512M or 64G)" if key == "ram" else (
                 "positive count (e.g. 512, 1.5k, 2M)"
@@ -223,7 +242,7 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
             )
         values[key] = val
         i += 2
-    if not values:
+    if not values and controller_enabled is None:
         return _cache_error(usage)
     return CacheCommand(
         action="rebuild",
@@ -232,6 +251,9 @@ def _parse_cache_command(args: List[str], pools: CachePools) -> CacheCommand:
         mamba=values.get("mamba"),
         swa_tokens=values.get("swa"),
         ram_bytes=values.get("ram"),
+        controller_enabled=controller_enabled,
+        prefetch_experts=values.get("prefetch"),
+        microbatch_tokens=values.get("microbatch"),
     )
 
 
@@ -422,6 +444,21 @@ async def _handle_cache_command(
             if num_swa_pages is not None else "",
             _target("ram", f"{command.ram_bytes} bytes", command.ram_bytes)
             if command.ram_bytes is not None else "",
+            (
+                f"controller={'on' if command.controller_enabled else 'off'}"
+                if command.controller_enabled is not None
+                else ""
+            ),
+            (
+                f"prefetch={command.prefetch_experts} experts"
+                if command.prefetch_experts is not None
+                else ""
+            ),
+            (
+                f"microbatch={command.microbatch_tokens} tokens"
+                if command.microbatch_tokens is not None
+                else ""
+            ),
         )
         if part
     )
@@ -433,6 +470,16 @@ async def _handle_cache_command(
             num_mamba_slots=command.mamba,
             num_swa_pages=num_swa_pages,
             ram_bytes=command.ram_bytes,
+            controller_enabled=command.controller_enabled,
+            controller_limits={
+                name: value
+                for name, value in (
+                    ("prefetch_experts", command.prefetch_experts),
+                    ("microbatch_tokens", command.microbatch_tokens),
+                )
+                if value is not None
+            }
+            or None,
         )
     except ShellClientError as exc:
         renderer.write(f"{exc}\n")

@@ -546,9 +546,28 @@ def parse_args(
         help=(
             "Bound host RAM used for MoE experts loaded from FTW/NVMe. "
             "Accepts bytes, K/M/G/T, 'auto' (MemAvailable minus reserve), or "
-            "'all' (the existing full host-bank path). Bounded mode uses eager "
-            "GPU offload and disables CUDA graphs and prefill overlap."
+            "'all' (the existing full host-bank path). Bounded mode uses its "
+            "asynchronous transfer pipeline and enables CUDA graphs only when "
+            "both RAM and VRAM can keep every expert in stable slots."
         ),
+    )
+    parser.add_argument(
+        "--moe-cache-controller",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.moe_cache_controller,
+        help="Enable bounded expert prediction and token microbatching.",
+    )
+    parser.add_argument(
+        "--moe-prefetch-experts",
+        type=int,
+        default=ServerArgs.moe_prefetch_experts,
+        help="Maximum experts in one bounded speculative prefetch.",
+    )
+    parser.add_argument(
+        "--moe-prefill-microbatch-tokens",
+        type=int,
+        default=ServerArgs.moe_prefill_microbatch_tokens,
+        help="Maximum tokens per bounded prefill microbatch.",
     )
 
     parser.add_argument(

@@ -11,6 +11,8 @@ Page size is parametrized over {1, 4} wherever it is load-bearing.  Slot ids are
 and never reused, so ``session.kv.free`` is an exact, public record of what the cache handed back.
 """
 from __future__ import annotations
+import gc
+import weakref
 
 import pytest
 
@@ -438,3 +440,28 @@ def test_insert_owns_its_indices_and_survives_caller_mutation(sess4: Session):
 
     assert sess4.ad.match(ids).indices == slots
     assert -1 not in sess4.ad.tree_slots()
+
+
+def test_prefix_node_owns_compact_expert_summary_until_eviction(sess4):
+    ids = seq(sess4.P, 1, 2)
+    slots = sess4.kv.take(len(ids))
+    sess4.do_insert(ids, slots=slots)
+    match, _ = sess4.do_match(ids)
+    node = match.node
+    node.expert_summary = {0: (2, 1), 1: (3,)}
+    node.expert_signature = "model:weights:tokenizer:adapter:execution"
+
+    repeated, _ = sess4.do_match(ids)
+    assert repeated.cached_len == len(ids)
+    assert repeated.node.expert_summary == {0: (2, 1), 1: (3,)}
+    assert (
+        repeated.node.expert_signature
+        == "model:weights:tokenizer:adapter:execution"
+    )
+
+    node_ref = weakref.ref(node)
+    del repeated, match, node
+    sess4.do_evict_full(len(ids))
+    gc.collect()
+    assert node_ref() is None
+    assert sess4.ad.root.children == {}

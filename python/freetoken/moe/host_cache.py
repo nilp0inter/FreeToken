@@ -2,15 +2,16 @@
 
 The normal offload path keeps one host tensor for every expert.  Bounded mode
 keeps only a fixed number of expert rows in pinned host slots and reads misses
-from FTW on demand.  The cache is deliberately synchronous at this boundary:
-its caller runs in eager mode, so an expert is fully read before its GPU slot
+from FTW on demand. A slot remains LOADING until its read completes, then its
 mapping becomes visible.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from itertools import count
+from queue import PriorityQueue
 import gc
 import math
 import os
@@ -57,6 +58,303 @@ class SlotState(str, Enum):
     LOADING = "loading"
     READY = "ready"
     IN_FLIGHT = "in_flight"
+
+class CachePhase(str, Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+    PREFETCH = "prefetch"
+
+
+class CacheTier(str, Enum):
+    VRAM = "vram"
+    RAM = "ram"
+    NVME = "nvme"
+    CPU = "cpu"
+
+
+_METRIC_FIELDS = (
+
+    "requests",
+    "hits",
+    "misses",
+    "bytes",
+    "admissions",
+    "evictions",
+    "bypasses",
+    "useful_prefetches",
+    "failed_prefetches",
+)
+class ExpertIoCoordinator:
+    """Persistent priority scheduler for demand, dense, and prefetch reads."""
+
+    _PRIORITY = {"demand": 0, "dense": 1, "prefetch": 2}
+
+    def __init__(self, workers: int = 8):
+        self._queue: PriorityQueue = PriorityQueue()
+        self._sequence = count()
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"ft-moe-io-{worker_id}",
+                daemon=True,
+            )
+            for worker_id in range(max(1, int(workers)))
+        ]
+        self._closed = False
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, kind: str, function, *args) -> Future:
+        if kind not in self._PRIORITY:
+            raise ValueError(f"unknown I/O priority {kind!r}")
+        if self._closed:
+            raise RuntimeError("expert I/O coordinator is closed")
+        future = Future()
+        self._queue.put(
+            (
+                self._PRIORITY[kind],
+                next(self._sequence),
+                future,
+                function,
+                args,
+            )
+        )
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            _priority, _sequence, future, function, args = self._queue.get()
+            try:
+                if function is None:
+                    return
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(function(*args))
+                except BaseException as exc:
+                    future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self, wait: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _thread in self._threads:
+            self._queue.put(
+                (3, next(self._sequence), Future(), None, ())
+            )
+        if wait:
+            for thread in self._threads:
+                thread.join()
+
+
+
+class CacheTelemetry:
+    """Thread-safe bounded counters and dependency intervals."""
+
+    def __init__(self, trace_capacity: int = 4096):
+        self._lock = threading.Lock()
+        self._counters: dict[tuple[str, int, str], dict[str, int]] = {}
+        self._intervals: deque[dict] = deque(maxlen=trace_capacity)
+        self._trace: deque[dict] = deque(maxlen=trace_capacity)
+        self._tracing = False
+
+    def record(
+        self,
+        phase: str | CachePhase,
+        layer_id: int,
+        tier: str | CacheTier,
+        event: str,
+        *,
+        nbytes: int = 0,
+        started_ns: int | None = None,
+        finished_ns: int | None = None,
+        expert_id: int | None = None,
+    ) -> None:
+        phase_name = str(phase.value if isinstance(phase, CachePhase) else phase)
+        tier_name = str(tier.value if isinstance(tier, CacheTier) else tier)
+        if event not in _METRIC_FIELDS:
+            raise ValueError(f"unknown cache metric {event!r}")
+        with self._lock:
+            key = (phase_name, int(layer_id), tier_name)
+            counters = self._counters.setdefault(
+                key, {name: 0 for name in _METRIC_FIELDS}
+            )
+            counters[event] += 1
+            counters["bytes"] += int(nbytes)
+            if started_ns is not None and finished_ns is not None:
+                interval = {
+                    "phase": phase_name,
+                    "layer": int(layer_id),
+                    "tier": tier_name,
+                    "start_ns": int(started_ns),
+                    "end_ns": int(finished_ns),
+                }
+                self._intervals.append(interval)
+                if self._tracing:
+                    self._trace.append(
+                        {**interval, "event": event, "expert": expert_id}
+                    )
+
+    def set_tracing(self, enabled: bool) -> None:
+        with self._lock:
+            self._tracing = bool(enabled)
+            if enabled:
+                self._trace.clear()
+
+    @staticmethod
+    def _union_ns(intervals: list[tuple[int, int]]) -> int:
+        if not intervals:
+            return 0
+        merged = 0
+        start, end = sorted(intervals)[0]
+        for next_start, next_end in sorted(intervals)[1:]:
+            if next_start <= end:
+                end = max(end, next_end)
+            else:
+                merged += end - start
+                start, end = next_start, next_end
+        return merged + end - start
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            rows = [
+                {
+                    "phase": phase,
+                    "layer": layer,
+                    "tier": tier,
+                    **counters,
+                }
+                for (phase, layer, tier), counters in sorted(self._counters.items())
+            ]
+            intervals = list(self._intervals)
+            trace = list(self._trace)
+            tracing = self._tracing
+        by_tier: dict[str, list[tuple[int, int]]] = {}
+        all_intervals = []
+        for item in intervals:
+            interval = (item["start_ns"], item["end_ns"])
+            all_intervals.append(interval)
+            by_tier.setdefault(item["tier"], []).append(interval)
+        wait_ns = {
+            tier: self._union_ns(tier_intervals)
+            for tier, tier_intervals in by_tier.items()
+        }
+        dominant = (
+            max(wait_ns, key=lambda tier: wait_ns[tier])
+            if wait_ns
+            else "none"
+        )
+        return {
+            "rows": rows,
+            "critical_path_ns": self._union_ns(all_intervals),
+            "wait_ns": wait_ns,
+            "classification": f"{dominant}-bound" if dominant != "none" else "idle",
+            "tracing": tracing,
+            "trace": trace,
+        }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._counters.clear()
+            self._intervals.clear()
+            self._trace.clear()
+
+
+@dataclass
+class ExpertResidencyRecord:
+    layer_id: int
+    expert_id: int
+    ram_slot: int | None = None
+    ram_generation: int = 0
+    gpu_slot: int | None = None
+    gpu_generation: int = 0
+
+
+class ExpertResidencyDirectory:
+    """Single authority for published host and device expert mappings."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._records: dict[tuple[int, int], ExpertResidencyRecord] = {}
+        self._gpu_keys: dict[int, tuple[int, int]] = {}
+
+    def publish_ram(self, key: tuple[int, int], slot_id: int, generation: int) -> None:
+        with self._lock:
+            record = self._records.setdefault(key, ExpertResidencyRecord(*key))
+            record.ram_slot = int(slot_id)
+            record.ram_generation = int(generation)
+
+    def remove_ram(self, key: tuple[int, int], generation: int) -> None:
+        with self._lock:
+            record = self._records.get(key)
+            if record is None or record.ram_generation != generation:
+                return
+            if record.gpu_slot is not None:
+                raise RuntimeError("cannot remove host backing for a GPU-resident expert")
+            self._records.pop(key, None)
+
+    def publish_gpu(
+        self,
+        key: tuple[int, int],
+        ram_slot: int,
+        ram_generation: int,
+        gpu_slot: int,
+    ) -> int:
+        with self._lock:
+            record = self._records.get(key)
+            if (
+                record is None
+                or record.ram_slot != ram_slot
+                or record.ram_generation != ram_generation
+            ):
+                raise RuntimeError("GPU publication requires current host backing")
+            if record.gpu_slot is not None and record.gpu_slot != gpu_slot:
+                self._gpu_keys.pop(record.gpu_slot, None)
+            old_key = self._gpu_keys.get(gpu_slot)
+            if old_key is not None and old_key != key:
+                old = self._records.get(old_key)
+                if old is not None:
+                    old.gpu_slot = None
+            record.gpu_generation += 1
+            record.gpu_slot = int(gpu_slot)
+            self._gpu_keys[int(gpu_slot)] = key
+            return record.gpu_generation
+
+    def evict_gpu(self, gpu_slot: int) -> tuple[int, int] | None:
+        with self._lock:
+            key = self._gpu_keys.pop(int(gpu_slot), None)
+            if key is None:
+                return None
+            record = self._records.get(key)
+            if record is not None:
+                record.gpu_slot = None
+            return key
+
+    def clear_gpu(self) -> list[tuple[int, int]]:
+        with self._lock:
+            keys = list(self._gpu_keys.values())
+            for key in keys:
+                record = self._records.get(key)
+                if record is not None:
+                    record.gpu_slot = None
+            self._gpu_keys.clear()
+            return keys
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [
+                {
+                    "layer": record.layer_id,
+                    "expert": record.expert_id,
+                    "ram_slot": record.ram_slot,
+                    "ram_generation": record.ram_generation,
+                    "gpu_slot": record.gpu_slot,
+                    "gpu_generation": record.gpu_generation,
+                }
+                for record in self._records.values()
+            ]
 
 
 @dataclass(frozen=True)
@@ -226,45 +524,68 @@ class NvmeExpertStore:
         self.bank_specs: dict[str, BankSpec] = {}
         self._locations: dict[str, list[list[tuple[int, int]]]] = {}
 
-        entries = self.reader.entries("experts_bank")
-        if not entries:
-            self.close()
-            raise ValueError(f"FTW checkpoint {path!r} has no expert-bank entries")
-        row_entries = [e for e in entries if e["name"] not in ("gate_up_alpha", "down_alpha")]
-        by_layer: dict[str, dict[int, dict]] = {}
-        flat: dict[str, dict] = {}
-        for entry in row_entries:
-            match = _LAYER_ENTRY_RE.match(entry["name"])
-            if match is None:
-                flat[entry["name"]] = entry
-            else:
-                by_layer.setdefault(match.group("base"), {})[int(match.group("layer"))] = entry
-
-        meta_layers = self.reader.meta("expert_bank_num_layers")
-        if meta_layers is not None and int(meta_layers) != num_layers:
-            self.close()
-            raise ValueError(
-                f"FTW expert-bank metadata has {meta_layers} layers, expected {num_layers}"
-            )
-
-        try:
-            for name in self.bank_schema:
-                if name in flat and name in by_layer:
-                    raise ValueError(f"FTW bank {name!r} mixes flat and per-layer entries")
-                if name in flat:
-                    self._add_flat_bank(name, flat[name])
-                elif name in by_layer:
-                    self._add_layer_bank(name, by_layer[name])
+        pages_meta = self.reader.meta("expert_pages")
+        if pages_meta is not None:
+            self.capability = "expert_pages"
+            self._add_expert_pages(pages_meta)
+        else:
+            self.capability = "bank_rows"
+            entries = self.reader.entries("experts_bank")
+            if not entries:
+                self.close()
+                raise ValueError(
+                    f"FTW checkpoint {path!r} has no expert-bank entries"
+                )
+            row_entries = [
+                entry
+                for entry in entries
+                if entry["name"]
+                not in ("gate_up_alpha", "down_alpha")
+            ]
+            by_layer: dict[str, dict[int, dict]] = {}
+            flat: dict[str, dict] = {}
+            for entry in row_entries:
+                match = _LAYER_ENTRY_RE.match(entry["name"])
+                if match is None:
+                    flat[entry["name"]] = entry
                 else:
+                    by_layer.setdefault(match.group("base"), {})[
+                        int(match.group("layer"))
+                    ] = entry
+
+            meta_layers = self.reader.meta("expert_bank_num_layers")
+            if meta_layers is not None and int(meta_layers) != num_layers:
+                self.close()
+                raise ValueError(
+                    "FTW expert-bank metadata has "
+                    f"{meta_layers} layers, expected {num_layers}"
+                )
+            try:
+                for name in self.bank_schema:
+                    if name in flat and name in by_layer:
+                        raise ValueError(
+                            f"FTW bank {name!r} mixes flat and per-layer entries"
+                        )
+                    if name in flat:
+                        self._add_flat_bank(name, flat[name])
+                    elif name in by_layer:
+                        self._add_layer_bank(name, by_layer[name])
+                    else:
+                        raise ValueError(
+                            "FTW checkpoint is missing expert-bank entries "
+                            f"for {name!r}"
+                        )
+                unknown = (set(flat) | set(by_layer)) - set(
+                    self.bank_schema
+                )
+                if unknown:
                     raise ValueError(
-                        f"FTW checkpoint is missing expert-bank entries for {name!r}"
+                        "FTW checkpoint has unsupported expert banks: "
+                        f"{sorted(unknown)}"
                     )
-            unknown = (set(flat) | set(by_layer)) - set(self.bank_schema)
-            if unknown:
-                raise ValueError(f"FTW checkpoint has unsupported expert banks: {sorted(unknown)}")
-        except Exception:
-            self.close()
-            raise
+            except Exception:
+                self.close()
+                raise
 
         self.logical_bytes_per_expert = sum(spec.row_bytes for spec in self.bank_specs.values())
         self.slot_storage_bytes = sum(_align_up(spec.row_bytes) for spec in self.bank_specs.values())
@@ -273,6 +594,65 @@ class NvmeExpertStore:
             _align_up(spec.row_bytes * self.num_experts)
             for spec in self.bank_specs.values()
         )
+
+    def _add_expert_pages(self, metadata: dict) -> None:
+        if int(metadata.get("version", 0)) != 1:
+            raise ValueError("unsupported FTW expert-page metadata version")
+        pages = metadata.get("pages", [])
+        expected_count = self.num_layers * self.num_experts
+        if len(pages) != expected_count:
+            raise ValueError(
+                f"FTW has {len(pages)} expert pages, expected {expected_count}"
+            )
+        self._locations = {
+            name: [
+                [(0, 0) for _ in range(self.num_experts)]
+                for _ in range(self.num_layers)
+            ]
+            for name in self.bank_schema
+        }
+        self._page_locations: list[list[tuple[int, int]]] = [
+            [(0, 0) for _ in range(self.num_experts)]
+            for _ in range(self.num_layers)
+        ]
+        seen = set()
+        for page in pages:
+            layer_id = int(page["layer"])
+            expert_id = int(page["expert"])
+            key = (layer_id, expert_id)
+            if not (
+                0 <= layer_id < self.num_layers
+                and 0 <= expert_id < self.num_experts
+            ):
+                raise ValueError(f"FTW expert page {key} is out of range")
+            if key in seen:
+                raise ValueError(f"duplicate FTW expert page {key}")
+            seen.add(key)
+            self._page_locations[layer_id][expert_id] = (
+                int(page["global_off"]),
+                int(page["nbytes"]),
+            )
+            bank_meta = {item["name"]: item for item in page["banks"]}
+            if set(bank_meta) != set(self.bank_schema):
+                raise ValueError(f"FTW expert page {key} has invalid banks")
+            for name in self.bank_schema:
+                item = bank_meta[name]
+                dtype = _dtype_of(item["dtype"])
+                shape = tuple(int(value) for value in item["shape"])
+                nbytes = int(item["nbytes"])
+                spec = BankSpec(name, shape, dtype, nbytes)
+                previous = self.bank_specs.get(name)
+                if previous is not None and previous != spec:
+                    raise ValueError(
+                        f"FTW expert-page bank {name!r} changes layout"
+                    )
+                self.bank_specs[name] = spec
+                self._locations[name][layer_id][expert_id] = (
+                    int(page["global_off"]) + int(item["offset"]),
+                    nbytes,
+                )
+        if len(seen) != expected_count:
+            raise ValueError("FTW expert-page index is incomplete")
 
     def _check_entry(self, name: str, entry: dict, expected_rows: int) -> BankSpec:
         shape = tuple(int(v) for v in entry["shape"])
@@ -327,17 +707,38 @@ class NvmeExpertStore:
             return None
         return self.reader.read_tensor(entry)
 
-    def read_expert(self, layer_id: int, expert_id: int, destinations: dict[str, HostBank]) -> int:
+    def read_expert(
+        self,
+        layer_id: int,
+        expert_id: int,
+        destinations: dict[str, HostBank],
+    ) -> int:
         if not 0 <= layer_id < self.num_layers:
-            raise ValueError(f"layer_id {layer_id} out of range [0, {self.num_layers})")
+            raise ValueError(
+                f"layer_id {layer_id} out of range [0, {self.num_layers})"
+            )
         if not 0 <= expert_id < self.num_experts:
-            raise ValueError(f"expert_id {expert_id} out of range [0, {self.num_experts})")
+            raise ValueError(
+                f"expert_id {expert_id} out of range [0, {self.num_experts})"
+            )
         if set(destinations) != set(self.bank_schema):
-            raise ValueError("expert destination banks do not match the FTW bank schema")
+            raise ValueError(
+                "expert destination banks do not match the FTW bank schema"
+            )
+        if self.capability == "expert_pages":
+            requests = []
+            for name in self.bank_schema:
+                offset, nbytes = self._locations[name][layer_id][expert_id]
+                requests.append(
+                    (destinations[name].memoryview(), offset, nbytes)
+                )
+            return self.reader.read_ranges_into(requests)
         disk_bytes = 0
         for name in self.bank_schema:
             offset, nbytes = self._locations[name][layer_id][expert_id]
-            self.reader.read_range_into(destinations[name].memoryview(), offset, nbytes)
+            self.reader.read_range_into(
+                destinations[name].memoryview(), offset, nbytes
+            )
             disk_bytes += nbytes
         return disk_bytes
 
@@ -354,6 +755,26 @@ class NvmeExpertStore:
         if set(destinations) != set(self.bank_schema):
             raise ValueError("layer destination banks do not match the FTW bank schema")
         disk_bytes = 0
+        if self.capability == "expert_pages":
+            requests = []
+            for name in self.bank_schema:
+                destination = destinations[name].memoryview()
+                row_bytes = self.bank_specs[name].row_bytes
+                for expert_id in range(self.num_experts):
+                    offset, nbytes = self._locations[name][layer_id][expert_id]
+                    requests.append(
+                        (
+                            destination[
+                                expert_id * row_bytes :
+                                (expert_id + 1) * row_bytes
+                            ],
+                            offset,
+                            nbytes,
+                        )
+                    )
+            return self.reader.read_ranges_into(
+                requests, workers=workers
+            )
         for name in self.bank_schema:
             offset, _ = self._locations[name][layer_id][0]
             nbytes = self.bank_specs[name].row_bytes * self.num_experts
@@ -379,6 +800,7 @@ class _Slot:
     generation: int = 0
     segment: str = "probation"
     last_used: int = 0
+    pin_count: int = 0
 
 
 class HostExpertHandle:
@@ -450,8 +872,12 @@ class HostExpertCache:
         self._pin = torch.cuda.is_available() if pin is None else bool(pin)
         self._backing = "cuda" if self._pin else "mmap"
         self._lock = threading.RLock()
+        self.telemetry = CacheTelemetry()
+        self.residency = ExpertResidencyDirectory()
         self._frequency: dict[tuple[int, int], int] = {}
+        self._miss_cost_ns: dict[tuple[int, int], int] = {}
         self._map: dict[tuple[int, int], int] = {}
+        self._prefetched: set[tuple[int, int]] = set()
         self._clock = 0
         self._free_slots: deque[int] = deque()
         self._probation: OrderedDict[int, None] = OrderedDict()
@@ -469,7 +895,11 @@ class HostExpertCache:
         self._slots: list[_Slot] = []
         self._bypass: _Slot | None = None
         capacity = self._capacity_for_budget(self.per_rank_budget_bytes)
-        self._io_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ft-moe-io")
+        self._io_pool = ExpertIoCoordinator(workers=8)
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ft-expert-prefetch",
+        )
         try:
             self._slots = [self._new_slot() for _ in range(capacity)]
             self._layer_staging = (
@@ -568,7 +998,23 @@ class HostExpertCache:
     def _record_access(self, key: tuple[int, int]) -> None:
         self._frequency[key] = min(_MAX_FREQUENCY, self._frequency.get(key, 0) + 1)
 
-    def record_accesses(self, layer_id: int, expert_ids: Iterable[int]) -> None:
+    def _admission_value(self, key: tuple[int, int]) -> float:
+        reuse = max(1, self._frequency.get(key, 0))
+        fallback_cost = (
+            self._disk_latency_ns // self._disk_reads
+            if self._disk_reads
+            else 1
+        )
+        miss_cost = self._miss_cost_ns.get(key, fallback_cost)
+        return reuse * miss_cost / self.slot_storage_bytes
+
+    def record_accesses(
+        self,
+        layer_id: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: str | CachePhase = CachePhase.DECODE,
+    ) -> None:
         """Record routed accesses and keep RAM copies of GPU hits recent."""
         layer_id = int(layer_id)
         if not 0 <= layer_id < self.store.num_layers:
@@ -582,11 +1028,14 @@ class HostExpertCache:
                 slot_id = self._map.get(key)
                 if slot_id is not None and self._slots[slot_id].state is SlotState.READY:
                     self._touch(slot_id)
+                self.telemetry.record(phase, layer_id, CacheTier.RAM, "requests")
 
     def _touch(self, slot_id: int) -> None:
         slot = self._slots[slot_id]
         self._clock += 1
         slot.last_used = self._clock
+        if slot.pin_count or slot.state is SlotState.IN_FLIGHT:
+            return
         if slot.segment == "protected":
             self._protected[slot_id] = None
             self._protected.move_to_end(slot_id)
@@ -615,18 +1064,55 @@ class HostExpertCache:
             self._probation.pop(slot_id, None)
             self._protected.pop(slot_id, None)
 
-    def _load(self, slot: _Slot, layer_id: int, expert_id: int) -> None:
+    def _load(
+        self,
+        slot: _Slot,
+        layer_id: int,
+        expert_id: int,
+        phase: str | CachePhase,
+    ) -> None:
         started = time.perf_counter_ns()
         slot.state = SlotState.LOADING
         try:
-            disk_bytes = self.store.read_expert(layer_id, expert_id, slot.banks)
+            kind = (
+                "prefetch"
+                if phase == CachePhase.PREFETCH or phase == "prefetch"
+                else "demand"
+            )
+            io_pool = self._io_pool
+            assert io_pool is not None
+            disk_bytes = io_pool.submit(
+                kind,
+                self.store.read_expert,
+                layer_id,
+                expert_id,
+                slot.banks,
+            ).result()
         except Exception:
             slot.state = SlotState.FREE
             slot.key = None
+            self.telemetry.record(phase, layer_id, CacheTier.NVME, "misses")
             raise
+        finished = time.perf_counter_ns()
         self._disk_bytes += disk_bytes
         self._disk_reads += 1
-        self._disk_latency_ns += time.perf_counter_ns() - started
+        self._disk_latency_ns += finished - started
+        key = (layer_id, expert_id)
+        elapsed = finished - started
+        previous = self._miss_cost_ns.get(key)
+        self._miss_cost_ns[key] = (
+            elapsed if previous is None else (previous * 7 + elapsed) // 8
+        )
+        self.telemetry.record(
+            phase,
+            layer_id,
+            CacheTier.NVME,
+            "requests",
+            nbytes=disk_bytes,
+            started_ns=started,
+            finished_ns=finished,
+            expert_id=expert_id,
+        )
 
     def _handle_for_slot(self, slot_id: int) -> HostExpertHandle:
         slot = self._slots[slot_id]
@@ -639,14 +1125,19 @@ class HostExpertCache:
             False,
         )
 
-    def _load_bypass(self, layer_id: int, expert_id: int) -> HostExpertHandle:
+    def _load_bypass(
+        self,
+        layer_id: int,
+        expert_id: int,
+        phase: str | CachePhase,
+    ) -> HostExpertHandle:
         if self._bypass is None or self._bypass_busy:
             raise RuntimeError("bounded MoE RAM cache bypass workspace is already in use")
         self._bypass_busy = True
         self._bypass_generation += 1
         generation = self._bypass_generation
         try:
-            self._load(self._bypass, layer_id, expert_id)
+            self._load(self._bypass, layer_id, expert_id, phase)
             self._bypass.state = SlotState.IN_FLIGHT
             return HostExpertHandle(
                 self,
@@ -674,6 +1165,8 @@ class HostExpertCache:
         *,
         prefill: bool = False,
         observe: bool = True,
+        force_admit: bool = False,
+        phase: str | CachePhase = CachePhase.DECODE,
     ) -> HostExpertHandle:
         """Return an expert from RAM or load it from FTW.
 
@@ -695,35 +1188,62 @@ class HostExpertCache:
             if slot_id is not None and self._slots[slot_id].state is SlotState.READY:
                 self._hits += 1
                 self._touch(slot_id)
+                self.telemetry.record(phase, layer_id, CacheTier.RAM, "hits")
+                if (
+                    phase != CachePhase.PREFETCH
+                    and phase != "prefetch"
+                    and key in self._prefetched
+                ):
+                    self._prefetched.remove(key)
+                    self.telemetry.record(
+                        phase,
+                        layer_id,
+                        CacheTier.RAM,
+                        "useful_prefetches",
+                    )
                 return self._handle_for_slot(slot_id)
 
             self._misses += 1
             victim_id = None if prefill else self._victim()
             victim = self._slots[victim_id] if victim_id is not None else None
-            candidate_frequency = self._frequency.get(key, 0)
             if (
                 not prefill
+                and not force_admit
                 and victim is not None
                 and victim.key is not None
-                and candidate_frequency < self._frequency.get(victim.key, 0)
+                and self._admission_value(key)
+                < self._admission_value(victim.key)
             ):
                 self._bypasses += 1
-                return self._load_bypass(layer_id, expert_id)
+                self.telemetry.record(phase, layer_id, CacheTier.RAM, "bypasses")
+                return self._load_bypass(layer_id, expert_id, phase)
             if prefill or victim_id is None:
                 self._bypasses += 1
-                return self._load_bypass(layer_id, expert_id)
+                self.telemetry.record(phase, layer_id, CacheTier.RAM, "bypasses")
+                return self._load_bypass(layer_id, expert_id, phase)
 
             if victim is None:
                 raise RuntimeError("bounded MoE RAM cache has no eviction victim")
             self._claim_victim(victim_id)
             if victim.key is not None:
-                self._map.pop(victim.key, None)
+                old_key = victim.key
+                self._map.pop(old_key, None)
+                self.residency.remove_ram(old_key, victim.generation)
                 self._evictions += 1
+                self.telemetry.record(phase, layer_id, CacheTier.RAM, "evictions")
+                if old_key in self._prefetched:
+                    self._prefetched.remove(old_key)
+                    self.telemetry.record(
+                        phase,
+                        old_key[0],
+                        CacheTier.RAM,
+                        "failed_prefetches",
+                    )
             victim.generation += 1
             victim.key = key
             victim.segment = "probation"
             try:
-                self._load(victim, layer_id, expert_id)
+                self._load(victim, layer_id, expert_id, phase)
             except Exception:
                 victim.key = None
                 victim.state = SlotState.FREE
@@ -731,6 +1251,8 @@ class HostExpertCache:
                 raise
             victim.state = SlotState.READY
             self._map[key] = victim_id
+            self.residency.publish_ram(key, victim_id, victim.generation)
+            self.telemetry.record(phase, layer_id, CacheTier.RAM, "admissions")
             self._touch(victim_id)
             return self._handle_for_slot(victim_id)
 
@@ -740,6 +1262,8 @@ class HostExpertCache:
         expert_ids: Iterable[int],
         *,
         observe: bool = True,
+        force_admit: bool = False,
+        phase: str | CachePhase = CachePhase.DECODE,
     ) -> tuple[dict[int, HostExpertHandle], list[int]]:
         """Load persistent-cache candidates concurrently.
 
@@ -768,6 +1292,19 @@ class HostExpertCache:
                     self._protected.pop(slot_id, None)
                     self._slots[slot_id].state = SlotState.IN_FLIGHT
                     handles[expert_id] = handle
+                    self.telemetry.record(phase, layer_id, CacheTier.RAM, "hits")
+                    if (
+                        phase != CachePhase.PREFETCH
+                        and phase != "prefetch"
+                        and key in self._prefetched
+                    ):
+                        self._prefetched.remove(key)
+                        self.telemetry.record(
+                            phase,
+                            layer_id,
+                            CacheTier.RAM,
+                            "useful_prefetches",
+                        )
                     continue
 
                 victim_id = self._victim()
@@ -775,27 +1312,43 @@ class HostExpertCache:
                 if (
                     victim is None
                     or (
-                        victim.key is not None
-                        and self._frequency.get(key, 0)
-                        < self._frequency.get(victim.key, 0)
+                        (phase == CachePhase.PREFETCH or phase == "prefetch")
+                        and victim.segment == "protected"
+                    )
+                    or (
+                        not force_admit
+                        and victim.key is not None
+                        and self._admission_value(key)
+                        < self._admission_value(victim.key)
                     )
                 ):
                     bypass_ids.append(expert_id)
+                    self.telemetry.record(phase, layer_id, CacheTier.RAM, "bypasses")
                     continue
                 assert victim_id is not None
                 self._misses += 1
 
                 self._claim_victim(victim_id)
                 if victim.key is not None:
-                    self._map.pop(victim.key, None)
+                    old_key = victim.key
+                    self._map.pop(old_key, None)
+                    self.residency.remove_ram(old_key, victim.generation)
                     self._evictions += 1
-                victim.generation += 1
+                    self.telemetry.record(phase, layer_id, CacheTier.RAM, "evictions")
+                    if old_key in self._prefetched:
+                        self._prefetched.remove(old_key)
+                        self.telemetry.record(
+                            phase,
+                            old_key[0],
+                            CacheTier.RAM,
+                            "failed_prefetches",
+                        )
                 victim.key = key
                 victim.segment = "probation"
                 victim.state = SlotState.LOADING
                 reserved.append((expert_id, victim_id))
 
-        def load_one(item: tuple[int, int]) -> tuple[int, int, int]:
+        def load_one(item: tuple[int, int]) -> tuple[int, int, int, int]:
             expert_id, slot_id = item
             started = time.perf_counter_ns()
             disk_bytes = self.store.read_expert(
@@ -803,11 +1356,18 @@ class HostExpertCache:
                 expert_id,
                 self._slots[slot_id].banks,
             )
-            return expert_id, disk_bytes, time.perf_counter_ns() - started
+            return expert_id, disk_bytes, started, time.perf_counter_ns()
 
         io_pool = self._io_pool
         assert io_pool is not None
-        futures = [io_pool.submit(load_one, item) for item in reserved]
+        kind = (
+            "prefetch"
+            if phase == CachePhase.PREFETCH or phase == "prefetch"
+            else "demand"
+        )
+        futures = [
+            io_pool.submit(kind, load_one, item) for item in reserved
+        ]
         try:
             loaded = [future.result() for future in futures]
         except Exception:
@@ -828,16 +1388,39 @@ class HostExpertCache:
                     self.release_in_flight(handle)
             raise
 
-        loaded_stats = {expert_id: (disk_bytes, elapsed) for expert_id, disk_bytes, elapsed in loaded}
+        loaded_stats = {
+            expert_id: (disk_bytes, started, finished)
+            for expert_id, disk_bytes, started, finished in loaded
+        }
         with self._lock:
             for expert_id, slot_id in reserved:
                 slot = self._slots[slot_id]
-                disk_bytes, elapsed = loaded_stats[expert_id]
+                disk_bytes, started, finished = loaded_stats[expert_id]
+                elapsed = finished - started
                 self._disk_bytes += disk_bytes
                 self._disk_reads += 1
                 self._disk_latency_ns += elapsed
                 slot.state = SlotState.IN_FLIGHT
-                self._map[(layer_id, expert_id)] = slot_id
+                key = (layer_id, expert_id)
+                previous = self._miss_cost_ns.get(key)
+                self._miss_cost_ns[key] = (
+                    elapsed
+                    if previous is None
+                    else (previous * 7 + elapsed) // 8
+                )
+                self._map[key] = slot_id
+                self.residency.publish_ram(key, slot_id, slot.generation)
+                self.telemetry.record(
+                    phase,
+                    layer_id,
+                    CacheTier.NVME,
+                    "requests",
+                    nbytes=disk_bytes,
+                    started_ns=started,
+                    finished_ns=finished,
+                    expert_id=expert_id,
+                )
+                self.telemetry.record(phase, layer_id, CacheTier.RAM, "admissions")
                 handles[expert_id] = HostExpertHandle(
                     self,
                     {name: slot.banks[name].tensor[0] for name in self.bank_schema},
@@ -846,18 +1429,76 @@ class HostExpertCache:
                     False,
                 )
         return handles, bypass_ids
+    def prefetch_many(
+        self, layer_id: int, expert_ids: Iterable[int]
+    ) -> tuple[int, int]:
+        ids = list(dict.fromkeys(int(expert) for expert in expert_ids))
+        with self._lock:
+            absent = {
+                expert
+                for expert in ids
+                if (int(layer_id), expert) not in self._map
+            }
+        handles, bypass_ids = self.get_many(
+            layer_id,
+            ids,
+            observe=False,
+            force_admit=False,
+            phase=CachePhase.PREFETCH,
+        )
+        try:
+            with self._lock:
+                for expert_id in absent:
+                    if expert_id in handles:
+                        self._prefetched.add((int(layer_id), expert_id))
+        finally:
+            for handle in handles.values():
+                self.release_in_flight(handle)
+        return len(handles), len(bypass_ids)
+    def submit_prefetch(
+        self, layer_id: int, expert_ids: Iterable[int]
+    ) -> Future[tuple[int, int]]:
+        pool = self._prefetch_pool
+        if pool is None:
+            raise RuntimeError("bounded MoE RAM cache is closed")
+        ids = tuple(int(expert) for expert in expert_ids)
+        return pool.submit(self.prefetch_many, int(layer_id), ids)
 
 
-    def load_layer(self, layer_id: int) -> dict[str, torch.Tensor]:
+
+
+    def load_layer(
+        self,
+        layer_id: int,
+        *,
+        phase: str | CachePhase = CachePhase.PREFILL,
+    ) -> dict[str, torch.Tensor]:
         """Load a full layer into the fixed pinned staging workspace."""
         if not self._layer_staging:
             raise RuntimeError("RAM cache budget has no complete-layer staging workspace")
         with self._lock:
             started = time.perf_counter_ns()
-            disk_bytes = self.store.read_layer(layer_id, self._layer_staging)
+            io_pool = self._io_pool
+            assert io_pool is not None
+            disk_bytes = io_pool.submit(
+                "dense",
+                self.store.read_layer,
+                layer_id,
+                self._layer_staging,
+            ).result()
+            finished = time.perf_counter_ns()
             self._disk_bytes += disk_bytes
             self._disk_reads += self.store.num_experts
-            self._disk_latency_ns += time.perf_counter_ns() - started
+            self._disk_latency_ns += finished - started
+            self.telemetry.record(
+                phase,
+                layer_id,
+                CacheTier.NVME,
+                "requests",
+                nbytes=disk_bytes,
+                started_ns=started,
+                finished_ns=finished,
+            )
             return {
                 name: self._layer_staging[name].tensor
                 for name in self.bank_schema
@@ -883,10 +1524,55 @@ class HostExpertCache:
             if slot.generation != handle.generation or slot.state is not SlotState.IN_FLIGHT:
                 raise RuntimeError("stale bounded MoE RAM cache handle")
             slot.state = SlotState.READY
+            if slot.pin_count:
+                return
             if slot.segment == "protected":
                 self._protected[handle.slot_id] = None
             else:
                 self._probation[handle.slot_id] = None
+    def pin_for_gpu(
+        self, handle: HostExpertHandle, gpu_slot: int
+    ) -> tuple[int, int]:
+        if handle._bypass or handle.slot_id is None:
+            raise RuntimeError("GPU residency requires persistent host backing")
+        with self._lock:
+            slot = self._slots[handle.slot_id]
+            if (
+                slot.key is None
+                or slot.generation != handle.generation
+                or slot.state is not SlotState.IN_FLIGHT
+            ):
+                raise RuntimeError("cannot pin a stale host expert handle")
+            slot.pin_count += 1
+            self._probation.pop(handle.slot_id, None)
+            self._protected.pop(handle.slot_id, None)
+            try:
+                gpu_generation = self.residency.publish_gpu(
+                    slot.key, handle.slot_id, handle.generation, gpu_slot
+                )
+            except Exception:
+                slot.pin_count -= 1
+                raise
+            return handle.slot_id, gpu_generation
+
+    def unpin_gpu(self, gpu_slot: int) -> tuple[int, int] | None:
+        with self._lock:
+            key = self.residency.evict_gpu(gpu_slot)
+            if key is None:
+                return None
+            slot_id = self._map.get(key)
+            if slot_id is None:
+                raise RuntimeError("GPU mapping lost its host backing")
+            slot = self._slots[slot_id]
+            if slot.pin_count <= 0:
+                raise RuntimeError("GPU mapping has no host pin")
+            slot.pin_count -= 1
+            if slot.pin_count == 0 and slot.state is SlotState.READY:
+                self._touch(slot_id)
+            return key
+
+    def set_tracing(self, enabled: bool) -> None:
+        self.telemetry.set_tracing(enabled)
 
     def reset_stats(self) -> None:
         with self._lock:
@@ -897,6 +1583,7 @@ class HostExpertCache:
             self._disk_bytes = 0
             self._disk_reads = 0
             self._disk_latency_ns = 0
+            self.telemetry.reset()
 
     def resize(
         self,
@@ -908,8 +1595,13 @@ class HostExpertCache:
         """Resize the fixed arena while idle, resetting cached entries and counters."""
         with self._lock:
             capacity = self._capacity_for_budget(int(per_rank_budget_bytes))
-            if self._bypass_busy or any(slot.state is SlotState.IN_FLIGHT for slot in self._slots):
-                raise RuntimeError("cannot resize the bounded MoE RAM cache while a slot is in flight")
+            if self._bypass_busy or any(
+                slot.state is SlotState.IN_FLIGHT or slot.pin_count
+                for slot in self._slots
+            ):
+                raise RuntimeError(
+                    "cannot resize the bounded MoE RAM cache while a slot is active"
+                )
             current = len(self._slots)
             extras: list[_Slot] = []
             if capacity > current:
@@ -932,6 +1624,7 @@ class HostExpertCache:
                 del tail
                 gc.collect()
             self._capacity_reset()
+            self.residency = ExpertResidencyDirectory()
             self.reset_stats()
             self.per_rank_budget_bytes = int(per_rank_budget_bytes)
             if host_budget_bytes is not None:
@@ -947,6 +1640,7 @@ class HostExpertCache:
 
     def _capacity_reset(self) -> None:
         self._map.clear()
+        self._prefetched.clear()
         self._frequency.clear()
         self._free_slots = deque(range(len(self._slots)))
         self._probation.clear()
@@ -956,15 +1650,26 @@ class HostExpertCache:
             slot.key = None
             slot.segment = "probation"
             slot.last_used = 0
+            slot.pin_count = 0
         self._clock = 0
         self._protected_limit = max(1, int(len(self._slots) * 0.8))
 
     def status(self) -> dict:
         with self._lock:
-            warm = sum(slot.state in (SlotState.READY, SlotState.IN_FLIGHT) for slot in self._slots)
+            warm = sum(
+                slot.state in (SlotState.READY, SlotState.IN_FLIGHT)
+                for slot in self._slots
+            )
             loading = sum(slot.state is SlotState.LOADING for slot in self._slots)
-            pinned = self.allocated_bytes_for_capacity(len(self._slots)) if self._pin else 0
-            return {
+            pinned_experts = sum(slot.pin_count > 0 for slot in self._slots)
+            pinned = (
+                self.allocated_bytes_for_capacity(len(self._slots))
+                if self._pin
+                else 0
+            )
+            bypass = self._bypass
+            assert bypass is not None
+            status = {
                 "mode": "bounded",
                 "requested": self.requested,
                 "requested_bytes": self.host_budget_bytes,
@@ -975,8 +1680,36 @@ class HostExpertCache:
                 "resident_bytes": warm * self.logical_bytes_per_expert,
                 "warm_experts": warm,
                 "loading_experts": loading,
+                "gpu_pinned_experts": pinned_experts,
                 "pinned_bytes": pinned,
                 "workspace_bytes": self.workspace_bytes,
+                "arenas": {
+                    "persistent": {
+                        "bytes": len(self._slots) * self.slot_storage_bytes,
+                        "addresses": [
+                            bank.tensor.data_ptr()
+                            for slot in self._slots
+                            for bank in slot.banks.values()
+                        ],
+                    },
+                    "transfer": {
+                        "bytes": self.slot_storage_bytes,
+                        "addresses": [
+                            bank.tensor.data_ptr()
+                            for bank in bypass.banks.values()
+                        ],
+                    },
+                    "dense_staging": {
+                        "bytes": self.layer_workspace_bytes,
+                        "addresses": [
+                            bank.tensor.data_ptr()
+                            for bank in self._layer_staging.values()
+                        ],
+                    },
+                    "total_bytes": self.allocated_bytes_for_capacity(
+                        len(self._slots)
+                    ),
+                },
                 "hits": self._hits,
                 "misses": self._misses,
                 "bypasses": self._bypasses,
@@ -984,9 +1717,16 @@ class HostExpertCache:
                 "disk_reads": self._disk_reads,
                 "disk_bytes": self._disk_bytes,
                 "disk_latency_us": self._disk_latency_ns / 1000.0,
+                "metrics": self.telemetry.snapshot(),
+                "residency_entries": len(self.residency.snapshot()),
             }
+            return status
 
     def close(self) -> None:
+        prefetch_pool = getattr(self, "_prefetch_pool", None)
+        if prefetch_pool is not None:
+            prefetch_pool.shutdown(wait=True, cancel_futures=True)
+            self._prefetch_pool = None
         io_pool = getattr(self, "_io_pool", None)
         if io_pool is not None:
             io_pool.shutdown(wait=True)
@@ -1008,12 +1748,19 @@ class HostExpertCache:
             store = getattr(self, "store", None)
             if store is not None:
                 store.close()
+            self.residency = ExpertResidencyDirectory()
             del slots
         gc.collect()
 
 
 __all__ = [
     "BankSpec",
+    "CachePhase",
+    "CacheTelemetry",
+    "CacheTier",
+    "ExpertIoCoordinator",
+    "ExpertResidencyDirectory",
+    "ExpertResidencyRecord",
     "HostExpertCache",
     "HostExpertHandle",
     "NvmeExpertStore",

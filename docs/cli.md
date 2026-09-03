@@ -82,6 +82,9 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--moe-ram-cache-size` | all | Host-RAM budget for expert rows in `offload`; accepts bytes, K/M/G/T, `auto`, or `all`. An explicit budget is divided across tensor-parallel ranks. |
+| `--moe-cache-controller` / `--no-moe-cache-controller` | on | Enable or disable bounded prefetch and token microbatch control |
+| `--moe-prefetch-experts` | 16 | Maximum experts in one speculative prefetch |
+| `--moe-prefill-microbatch-tokens` | 256 | Maximum tokens in one bounded prefill microbatch |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
@@ -89,15 +92,45 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
-`--moe-ram-cache-size` uses the normal full-RAM expert banks by default. A
-bounded value uses an FTW checkpoint as an NVMe row store and keeps a fixed
-number of expert rows in host RAM. Bounded mode requires `--moe-backend offload`,
-disables MoE prefill overlap and CUDA graphs, and loads cache misses
-synchronously.
+`--moe-ram-cache-size` uses the full host expert banks by default. A
+bounded value requires an FTW checkpoint and `--moe-backend offload`.
 
-For `auto`, FreeToken uses the smaller of `MemAvailable` and the remaining
-cgroup memory allowance, minus an 8 GiB reserve. Set
-`FREETOKEN_MOE_RAM_RESERVE_GB` to change the reserve.
+Bounded mode uses aligned FTW expert pages when the checkpoint contains them.
+It also reads older FTW bank-row layouts. Demand reads have priority over
+dense-stage reads and speculative reads.
+
+The RAM and VRAM caches use segmented LRU queues. Admission uses measured read
+cost, reuse frequency, and expert size. Dense prefill uses a separate staging
+arena, so a layer scan does not remove persistent experts.
+
+The controller uses prefix summaries and bounded layer transitions for
+speculative reads. Unused speculative entries stay in the probationary queue.
+They cannot remove protected demand entries. Set
+`--no-moe-cache-controller` to disable this work.
+
+Bounded CUDA graphs require stable slots for all model experts in RAM and
+VRAM. FreeToken disables CUDA graphs when either cache cannot hold all experts.
+
+For `auto`, FreeToken uses the smaller host or cgroup allowance. It subtracts
+an 8 GiB reserve. Set `FREETOKEN_MOE_RAM_RESERVE_GB` to change this reserve.
+
+`GET /v1/cache/status` reports capacities, arena bytes, residency, tier
+counters, transfer bytes, prefetch outcomes, and critical-path classification.
+The controller block reports measured sparse and dense prefill costs. Detailed
+expert traces stay off until the runtime enables them.
+
+Tune a bounded cache:
+
+1. Run the target prompt set with the controller disabled.
+2. Enable the controller without changing the cache sizes.
+3. Compare TTFT, decode throughput, hit rates, and `critical_path_ns`.
+4. Reduce prefetch or microbatch limits if unused prefetch work increases.
+
+`POST /v1/cache/rebuild` accepts `controller_enabled` and
+`controller_limits`. The limit keys are `prefetch_experts` and
+`microbatch_tokens`. The server checks all targets before it changes active
+allocation. Invalid targets leave all arenas unchanged. If a later GPU rebuild
+fails, the scheduler restores the previous geometry.
 
 ### API behaviour
 
@@ -130,8 +163,15 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
-| `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
+| `cache --moe N \| --kv N \| --mamba N \| --swa N \| --ram N [--controller on\|off] [--prefetch-experts N] [--microbatch-tokens N]` | `POST /v1/cache/rebuild` | Change cache limits without a restart |
 | `requests [--since N] [--limit N]` | `GET /v1/requests` | Recent request ring |
+
+The shell accepts the same controller targets. For example:
+
+```text
+/cache controller off
+/cache prefetch 8 microbatch 128
+```
 
 ## ft launch
 

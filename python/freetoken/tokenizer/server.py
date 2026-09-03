@@ -180,6 +180,8 @@ def tokenize_worker(
                             num_mamba_slots=m.num_mamba_slots,
                             num_swa_pages=m.num_swa_pages,
                             ram_bytes=m.ram_bytes,
+                            controller_enabled=m.controller_enabled,
+                            controller_limits=m.controller_limits,
                             mode=m.mode,
                         )
                     )
@@ -226,6 +228,7 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        ram_cache=msg.ram_cache,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

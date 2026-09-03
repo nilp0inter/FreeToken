@@ -684,6 +684,29 @@ class Engine:
                     banks.alpha("gate_up_alpha"),
                     banks.alpha("down_alpha"),
                 )
+                cache.configure_controller(
+                    enabled=config.moe_cache_controller,
+                    limits={
+                        "prefetch_experts": config.moe_prefetch_experts,
+                        "microbatch_tokens": (
+                            config.moe_prefill_microbatch_tokens
+                        ),
+                    },
+                )
+                if cache.can_enable_static_graphs:
+                    if config.cuda_graph_bs and config.cuda_graph_max_bs:
+                        cache.enable_static_graphs()
+                        logger.info_rank0(
+                            "Bounded MoE cache preloaded every expert with stable "
+                            "slot mappings; CUDA graphs remain enabled"
+                        )
+                else:
+                    object.__setattr__(config, "cuda_graph_bs", [])
+                    object.__setattr__(config, "cuda_graph_max_bs", 0)
+                    logger.info_rank0(
+                        "Bounded MoE cache cannot keep every expert in stable "
+                        "VRAM and RAM slots; CUDA graphs are disabled"
+                    )
             else:
                 cache.set_bank_sources(
                     banks.sources, layer_residency=banks.layer_residency
@@ -844,6 +867,8 @@ class Engine:
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
         ram_bytes: int | None = None,
+        controller_enabled: bool | None = None,
+        controller_limits: dict[str, int] | None = None,
     ) -> None:
         """Idle-only in-place resize of the MoE slot cache, KV page pool, GDN (mamba) state pool,
         window pool, and bounded host-RAM expert arena. GPU pool changes re-capture CUDA graphs.
@@ -858,6 +883,8 @@ class Engine:
             and num_mamba_slots is None
             and num_swa_pages is None
             and ram_bytes is None
+            and controller_enabled is None
+            and controller_limits is None
         ):
             return
 
@@ -887,6 +914,24 @@ class Engine:
             ram_per_rank = ram_bytes // tp_size
             try:
                 self.moe_offload_cache.ram_cache.validate_per_rank_budget(ram_per_rank)
+            except ValueError as e:
+                raise CacheRebuildRejected(str(e)) from e
+        controller_change = (
+            controller_enabled is not None or controller_limits is not None
+        )
+        if controller_change:
+            if (
+                self.moe_offload_cache is None
+                or self.moe_offload_cache.ram_cache is None
+            ):
+                raise CacheRebuildRejected(
+                    "cache controller requested but bounded MoE RAM cache is "
+                    "not enabled"
+                )
+            try:
+                self.moe_offload_cache.validate_controller_limits(
+                    controller_limits
+                )
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
         if num_pages is not None and num_pages <= 0:
@@ -949,6 +994,13 @@ class Engine:
             or num_mamba_slots is not None
             or num_swa_pages is not None
         )
+        if not gpu_resize and ram_per_rank is None:
+            assert self.moe_offload_cache is not None
+            self.moe_offload_cache.configure_controller(
+                enabled=controller_enabled,
+                limits=controller_limits,
+            )
+            return
         if ram_per_rank is not None:
             assert self.moe_offload_cache is not None
             assert ram_bytes is not None
@@ -958,6 +1010,10 @@ class Engine:
             )
             object.__setattr__(config, "moe_ram_cache_size", ram_bytes)
             if not gpu_resize:
+                self.moe_offload_cache.configure_controller(
+                    enabled=controller_enabled,
+                    limits=controller_limits,
+                )
                 return
 
 
@@ -1018,6 +1074,12 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if controller_change:
+            assert self.moe_offload_cache is not None
+            self.moe_offload_cache.configure_controller(
+                enabled=controller_enabled,
+                limits=controller_limits,
+            )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1315,6 +1377,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_ram_cache_size": None,
+    "moe_cache_controller": True,
+    "moe_prefetch_experts": 16,
+    "moe_prefill_microbatch_tokens": 256,
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
@@ -1553,11 +1618,9 @@ def _adjust_config(config: EngineConfig):
                 )
             override("moe_prefill_overlap", False)
             override("moe_prefill_hit_d2d", False)
-            override("cuda_graph_bs", [])
-            override("cuda_graph_max_bs", 0)
             logger.info_rank0(
-                "Bounded MoE RAM cache enabled: using eager FTW/NVMe row loads; "
-                "CUDA graphs and prefill overlap are disabled"
+                "Bounded MoE RAM cache enabled: using eager FTW/NVMe page loads; "
+                "prefill overlap is replaced by the bounded transfer pipeline"
             )
 
     if is_moe and config.moe_backend == "fused":

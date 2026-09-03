@@ -364,6 +364,21 @@ def _add_rebuild_args(parser: argparse.ArgumentParser) -> None:
         help="Host-wide bounded MoE RAM in bytes (K/M/G/T use powers of 1024)",
     )
     parser.add_argument(
+        "--controller",
+        choices=("on", "off"),
+        help="Enable or disable bounded cache prediction and microbatching",
+    )
+    parser.add_argument(
+        "--prefetch-experts",
+        type=parse_count,
+        help="Maximum experts in one speculative prefetch",
+    )
+    parser.add_argument(
+        "--microbatch-tokens",
+        type=parse_count,
+        help="Maximum tokens per bounded prefill microbatch",
+    )
+    parser.add_argument(
         "--wait",
         type=float,
         default=300.0,
@@ -423,7 +438,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft ctl") -> int:
             _print_doc(doc, _format_requests, raw_json=args.json)
             return 0
         if args.command == "cache" and args.cache_command in (None, "status"):
-            if args.cache_command is None and _cache_targets(args):
+            if args.cache_command is None and (
+                _cache_targets(args) or _controller_target(args)
+            ):
                 return _run_cache_rebuild(args)
             doc = _request_json("GET", args.base_url, "/v1/cache/status", timeout=args.timeout)
             _print_doc(doc, _format_cache_status, raw_json=args.json)
@@ -472,12 +489,14 @@ def _rebuild_body(targets: dict[str, int], geometry: dict[str, Any]) -> dict[str
 
 def _run_cache_rebuild(args: argparse.Namespace) -> int:
     targets = _cache_targets(args)
-    if not targets:
+    controller = _controller_target(args)
+    if not targets and not controller:
         print("error: cache rebuild requires at least one cache target", file=sys.stderr)
         return 2
-    # The token targets can only be converted against the live geometry, so read it first.
+    # Token targets can only be converted against the live geometry.
     status = _request_json("GET", args.base_url, "/v1/cache/status", timeout=args.timeout)
     body = _rebuild_body(targets, status.get("geometry") or {})
+    body.update(controller)
     body["timeout"] = args.wait
     doc = _request_json(
         "POST",
@@ -498,6 +517,21 @@ def _run_cache_rebuild(args: argparse.Namespace) -> int:
     except ControlCliError:
         pass
     return 0
+
+
+def _controller_target(args: argparse.Namespace) -> dict[str, Any]:
+    limits = {
+        name: value
+        for name in ("prefetch_experts", "microbatch_tokens")
+        if (value := getattr(args, name, None)) is not None
+    }
+    target: dict[str, Any] = {}
+    controller = getattr(args, "controller", None)
+    if controller is not None:
+        target["controller_enabled"] = controller == "on"
+    if limits:
+        target["controller_limits"] = limits
+    return target
 
 
 def _cache_targets(args: argparse.Namespace) -> dict[str, int]:

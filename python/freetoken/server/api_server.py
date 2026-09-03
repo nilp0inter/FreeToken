@@ -252,6 +252,9 @@ class FrontendManager:
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
+                ram_cache = getattr(msg, "ram_cache", None)
+                if isinstance(ram_cache, dict):
+                    self.ram_cache = ram_cache
                 self.stats.observe(msg)
                 if msg.uid not in self.ack_map:
                     continue
@@ -488,6 +491,8 @@ class CacheRebuildRequest(BaseModel):
     num_pages: int | None = None
     # Host-wide bounded MoE RAM target in bytes. It is divided across TP ranks by the engine.
     ram_bytes: int | None = None
+    controller_enabled: bool | None = None
+    controller_limits: Dict[str, int] | None = None
     # Usable GDN (mamba) state-pool slots (matches the status-bar total); the engine adds the
     # reserved padding sink internally.
     num_mamba_slots: int | None = None
@@ -513,6 +518,8 @@ async def dispatch_rebuild(
     num_mamba_slots: int | None = None,
     num_swa_pages: int | None = None,
     ram_bytes: int | None = None,
+    controller_enabled: bool | None = None,
+    controller_limits: Dict[str, int] | None = None,
     mode: str = "if_idle",
     timeout: float = 300.0,
 ) -> Dict[str, Any]:
@@ -534,6 +541,8 @@ async def dispatch_rebuild(
                 num_mamba_slots=num_mamba_slots,
                 num_swa_pages=num_swa_pages,
                 ram_bytes=ram_bytes,
+                controller_enabled=controller_enabled,
+                controller_limits=controller_limits,
                 mode=mode,
             )
         )
@@ -623,6 +632,8 @@ async def cache_rebuild(req: CacheRebuildRequest):
         num_mamba_slots=req.num_mamba_slots,
         num_swa_pages=_resolve_num_swa_pages(state, req),
         ram_bytes=req.ram_bytes,
+        controller_enabled=req.controller_enabled,
+        controller_limits=req.controller_limits,
         mode=req.mode,
         timeout=req.timeout,
     )
@@ -724,14 +735,11 @@ def _reasoning_geometry(state: Any) -> dict | None:
 
 
 def cache_geometry(state: Any) -> dict:
-    """Current cache geometry for the desktop cache panel. Each pool size resolves
-    most-recent-truth first: the last rebuild's result, else the running UserReply snapshot
-    (updated per generation), else the load-time allocation from the ("meta", …) ack — so the
-    panel shows the real allocation from the moment the server is ready, not zeros until the
-    first chat. moe_cache_size falls back further to the configured size (rate resolved to a
-    slot count, matching the shell status bar). num_experts / num_moe_layers are the per-layer
-    expert count and MoE layer count from model_config, so callers can derive the moe pool
-    bounds; both are 0 when config.model_config is absent/raises (dummy configs) or non-MoE."""
+    """Return current cache geometry for the desktop cache panel.
+
+    Running reply snapshots override rebuild and load-time snapshots. Other
+    pool sizes use the last rebuild before their load-time allocation.
+    """
     from .model_meta import moe_cache_size as configured_moe_cache_size
 
     tr = state.stats
@@ -764,9 +772,9 @@ def cache_geometry(state: Any) -> dict:
     except Exception:
         num_experts = 0
         num_moe_layers = 0
-    ram_cache = last.get("ram_cache")
+    ram_cache = getattr(state, "ram_cache", None)
     if not isinstance(ram_cache, dict):
-        ram_cache = getattr(state, "ram_cache", None)
+        ram_cache = last.get("ram_cache")
     ram_bytes = (
         int(ram_cache.get("requested_bytes", 0) or 0)
         if isinstance(ram_cache, dict) else 0
@@ -784,6 +792,18 @@ def cache_geometry(state: Any) -> dict:
         }
     except Exception:
         unit_bytes = {"kv_per_token": 0, "moe_per_expert": 0, "mamba_per_slot": 0, "swa_per_token": 0}
+    if isinstance(ram_cache, dict):
+        ram_cache = dict(ram_cache)
+        controller = dict(ram_cache.get("controller") or {})
+        arenas = dict(controller.get("arenas") or {})
+        arenas["kv"] = {
+            "physical_bytes": (
+                num_pages * page_size * unit_bytes["kv_per_token"]
+            ),
+            "logical_pages": num_pages,
+        }
+        controller["arenas"] = arenas
+        ram_cache["controller"] = controller
     # Thinking control: the gears a client can offer and the chat_template_kwargs
     # each selects, derived from the checkpoint's own probed template (no
     # per-family registry). None until the frontend tokenizer is warm — the

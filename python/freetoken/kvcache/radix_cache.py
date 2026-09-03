@@ -43,6 +43,8 @@ class RadixTreeNode:
         self.swa_tombstone: bool = False
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
+        self.expert_summary: dict[int, tuple[int, ...]] | None = None
+        self.expert_signature: str | None = None
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -172,6 +174,7 @@ class RadixPrefixCache(BasePrefixCache):
             self.evictable_size += new_node.length
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
+
 
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:

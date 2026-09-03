@@ -281,6 +281,13 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    @staticmethod
+    def _attach_expert_summary(req: Req, node) -> None:
+        if node is None or not req.moe_execution_signature:
+            return
+        node.expert_summary = dict(req.moe_demand_summary)
+        node.expert_signature = req.moe_execution_signature
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
@@ -312,6 +319,7 @@ class CacheManager:
             return
         insert_ids = req.input_ids[: req.cached_len]
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        self._attach_expert_summary(req, getattr(new_handle, "node", None))
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
@@ -391,6 +399,10 @@ class CacheManager:
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                summary_match = self.prefix_cache.match_prefix(
+                    req.input_ids[:insert_len]
+                )
+                self._attach_expert_summary(req, summary_match.node)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
@@ -420,6 +432,7 @@ class CacheManager:
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
         m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        self._attach_expert_summary(req, m.node)
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
@@ -467,6 +480,10 @@ class CacheManager:
                 req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
                 update_kv_after_len=old_handle.cached_len)
+            summary_match = self.prefix_cache.match_prefix(
+                req.input_ids[:insert_len]
+            )
+            self._attach_expert_summary(req, summary_match.node)
         self.unlock(old_handle)
         self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)

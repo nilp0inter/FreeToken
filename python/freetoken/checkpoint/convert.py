@@ -23,7 +23,7 @@ import threading
 
 import torch
 
-from .ftw import DEFAULT_SHARD_LIMIT, FTWWriter, layer_bank_entry_name
+from .ftw import DEFAULT_SHARD_LIMIT, FTWWriter
 
 # Machine-readable convert progress for a supervising process (e.g. a GUI frontend parses
 # these `FTCONVERT <phase> <done> <total>` stdout lines to drive its convert bar). Gated by
@@ -104,10 +104,10 @@ def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
 
 
 class _ConvertSink:
-    """Layer-completion sink for ``load_expert_banks(layer_sink=...)``: writes each
-    completed layer's banks as their own FTW entries immediately (name
-    ``f"{bank_name}#L{layer_id:05d}"``, kind ``"experts_bank"``) and releases them, so
-    conversion RAM peaks at ~in-flight layers instead of the whole bank set.
+    """Stream completed expert layers as bounded-memory FTW expert pages.
+
+    Each callback retains at most one model layer. The writer builds and writes
+    one complete expert page at a time before the source banks are released.
 
     Only engaged for streamable formats -- ``ExpertBanks.streamed`` reports whether this
     actually fired; if not, the caller falls back to the materialize-and-write path
@@ -136,14 +136,17 @@ class _ConvertSink:
                 from freetoken.utils.progress import byte_bar
 
                 self._bar = byte_bar(0, self._desc)  # total unknown up front (streamed)
-            nbytes = 0
-            for bank_name, bank in banks.items():
-                self._writer.add_tensor(
-                    layer_bank_entry_name(bank_name, layer_id), bank.tensor, kind="experts_bank"
-                )
-                nbytes += bank.nbytes
+            nbytes = sum(bank.nbytes for bank in banks.values())
+            self._writer.add_expert_layer(
+                layer_id,
+                {
+                    bank_name: bank.tensor
+                    for bank_name, bank in banks.items()
+                },
+            )
+            for bank in banks.values():
                 bank.release()
-                self.n_written += 1
+            self.n_written += len(banks)
             self.n_bytes += nbytes
             self._bar.update(nbytes)
             # Cumulative BYTES (not the bank count): the supervisor maps this against the
@@ -246,31 +249,38 @@ def convert_checkpoint(
                     writer.add_tensor(an, alpha, kind="experts_bank")
                     n_alpha += 1
         else:
-            # The on-disk format keeps one contiguous region per bank and the writer only
-            # has whole-tensor add_tensor, so the per-layer sources reassemble into one
-            # flat tensor (a per-bank host RAM spike during conversion).
-            items = []
-            for name, per_layer in banks.sources.items():
-                if num_layers is None:
-                    num_layers = len(per_layer)
-                else:
-                    assert len(per_layer) == num_layers, (name, len(per_layer), num_layers)
-                items.append((name, torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
-            for an in ("gate_up_alpha", "down_alpha"):
-                if getattr(banks, an, None) is not None:
-                    items.append((an, getattr(banks, an)))
-            total_bytes = sum(t.numel() * t.element_size() for _, t in items)
-            bar = byte_bar(total_bytes, "Converting expert banks")
+            sources = banks.sources
+            layer_counts = {len(per_layer) for per_layer in sources.values()}
+            if len(layer_counts) != 1:
+                raise ValueError("expert banks have inconsistent layer counts")
+            num_layers = layer_counts.pop()
+            total_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for per_layer in sources.values()
+                for tensor in per_layer
+            )
+            bar = byte_bar(total_bytes, "Converting expert pages")
             done_bytes = 0
             _progress("experts", 0, total_bytes)
-            for name, tensor in items:
-                writer.add_tensor(name, tensor, kind="experts_bank")
-                nbytes = tensor.numel() * tensor.element_size()
+            for layer_id in range(num_layers):
+                layer_banks = {
+                    name: per_layer[layer_id]
+                    for name, per_layer in sources.items()
+                }
+                writer.add_expert_layer(layer_id, layer_banks)
+                nbytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in layer_banks.values()
+                )
                 bar.update(nbytes)
                 done_bytes += nbytes
                 _progress("experts", done_bytes, total_bytes)
-                n_bank += name not in ("gate_up_alpha", "down_alpha")
-                n_alpha += name in ("gate_up_alpha", "down_alpha")
+            n_bank = len(sources) * num_layers
+            for name in ("gate_up_alpha", "down_alpha"):
+                alpha = getattr(banks, name, None)
+                if alpha is not None:
+                    writer.add_tensor(name, alpha, kind="experts_bank")
+                    n_alpha += 1
             bar.close()
 
     _progress("finalize")  # writing shard index + copying config/tokenizer

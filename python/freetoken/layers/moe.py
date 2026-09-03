@@ -1,4 +1,6 @@
+from collections import Counter
 import os
+import time
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -370,6 +372,110 @@ class OffloadMoELayer(MoELayer):
         )
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
         return gpu_routed + cpu_routed
+    def _record_request_demand(
+        self, cache: OffloadMoeCache, topk_ids: torch.Tensor
+    ) -> None:
+        try:
+            reqs = get_global_ctx().batch.reqs
+        except AssertionError:
+            # Direct layer tests and standalone kernel probes do not install a
+            # request context, so they have no prefix node to annotate.
+            return
+        if self.layer_id == 0:
+            prefix_summary: dict[int, set[int]] = {}
+            for req in reqs:
+                if req.moe_execution_signature != cache.execution_signature:
+                    continue
+                for layer_id, expert_ids in req.moe_demand_summary.items():
+                    prefix_summary.setdefault(layer_id, set()).update(
+                        expert_ids
+                    )
+            cache.prepare_prefix_experts(
+                {
+                    layer_id: tuple(sorted(expert_ids))
+                    for layer_id, expert_ids in prefix_summary.items()
+                },
+                cache.execution_signature,
+            )
+
+        routed = topk_ids.detach().cpu()
+        offset = 0
+        for req in reqs:
+            end = offset + req.extend_len
+            counts = Counter(
+                int(value)
+                for value in routed[offset:end].reshape(-1).tolist()
+            )
+            req.moe_demand_summary[self.layer_id] = tuple(
+                expert_id for expert_id, _ in counts.most_common(16)
+            )
+            req.moe_execution_signature = cache.execution_signature
+            offset = end
+
+    def _bounded_sparse_chunk(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        next_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        hit_slots, hit_mask, any_hit, all_hit = cache.bounded_gpu_hit_plan(
+            self.layer_id, topk_ids
+        )
+        hit_output = None
+        if any_hit:
+            hit_started = time.perf_counter_ns()
+            hit_output = self._expert_gemm(
+                cache,
+                hidden_states,
+                torch.where(
+                    hit_mask, topk_weights, topk_weights.new_zeros(())
+                ).contiguous(),
+                hit_slots,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=True,
+            )
+            cache.ram_cache.telemetry.record(
+                "prefill",
+                self.layer_id,
+                "vram",
+                "hits",
+                started_ns=hit_started,
+                finished_ns=time.perf_counter_ns(),
+            )
+        cache.ensure_experts(self.layer_id, topk_ids, phase="prefill")
+        if next_ids is not None:
+            cache.schedule_host_prefetch(
+                self.layer_id,
+                (
+                    int(value)
+                    for value in next_ids.detach().cpu().reshape(-1).tolist()
+                ),
+            )
+        if all_hit:
+            assert hit_output is not None
+            return hit_output
+        miss_output = self._expert_gemm(
+            cache,
+            hidden_states,
+            torch.where(
+                hit_mask, topk_weights.new_zeros(()), topk_weights
+            ).contiguous(),
+            topk_ids,
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=True,
+        )
+        return (
+            miss_output
+            if hit_output is None
+            else hit_output + miss_output
+        )
+
 
     def _prefill_routed(
         self,
@@ -383,6 +489,46 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.ram_cache is not None:
+            self._record_request_demand(cache, topk_ids)
+            if cache.bounded_prefill_mode(topk_ids) == "dense":
+                views = cache.bounded_dense_layer(self.layer_id, topk_ids)
+                return self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    views=views,
+                    n=self.num_experts,
+                    alphas=cache.alphas_for_layer(self.layer_id),
+                    is_prefill=True,
+                )
+            chunk_size = cache.bounded_prefill_microbatch_tokens(
+                hidden_states.size(0)
+            )
+            if chunk_size >= hidden_states.size(0):
+                return self._bounded_sparse_chunk(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    None,
+                )
+            outputs = []
+            for start in range(0, hidden_states.size(0), chunk_size):
+                end = min(start + chunk_size, hidden_states.size(0))
+                next_end = min(end + chunk_size, hidden_states.size(0))
+                next_ids = topk_ids[end:next_end] if end < next_end else None
+                outputs.append(
+                    self._bounded_sparse_chunk(
+                        cache,
+                        hidden_states[start:end],
+                        topk_weights[start:end],
+                        topk_ids[start:end],
+                        next_ids,
+                    )
+                )
+            return torch.cat(outputs, dim=0)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -481,7 +627,7 @@ class OffloadMoELayer(MoELayer):
                     *views,
                     topk_weights,
                     topk_ids,
-                    n,
+                    n if n is not None else cache.cache_size,
                     self.activation,
                     self.apply_router_weight_on_input,
                     act_alpha,

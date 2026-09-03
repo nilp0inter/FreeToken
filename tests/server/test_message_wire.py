@@ -25,23 +25,63 @@ from freetoken.core import SamplingParams
 
 def test_cache_rebuild_msg_roundtrip():
     msg = CacheRebuildMsg(
-        request_id="abc", moe_cache_size=8, num_pages=1024, ram_bytes=64 << 30, mode="if_idle"
+        request_id="abc",
+        moe_cache_size=8,
+        num_pages=1024,
+        ram_bytes=64 << 30,
+        controller_enabled=False,
+        controller_limits={"prefetch_experts": 8},
+        mode="if_idle",
     )
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.ram_bytes, out.mode) == (
-        "abc", 8, 1024, 64 << 30, "if_idle",
+    assert (
+        out.request_id,
+        out.moe_cache_size,
+        out.num_pages,
+        out.ram_bytes,
+        out.controller_enabled,
+        out.controller_limits,
+        out.mode,
+    ) == (
+        "abc",
+        8,
+        1024,
+        64 << 30,
+        False,
+        {"prefetch_experts": 8},
+        "if_idle",
     )
 
 
 def test_cache_rebuild_backend_msg_roundtrip():
     msg = CacheRebuildBackendMsg(
-        request_id="r1", moe_cache_size=None, num_pages=256, ram_bytes=64 << 30, mode="drain"
+        request_id="r1",
+        moe_cache_size=None,
+        num_pages=256,
+        ram_bytes=64 << 30,
+        controller_enabled=True,
+        controller_limits={"microbatch_tokens": 128},
+        mode="drain",
     )
     out = BaseBackendMsg.decoder(msg.encoder())
     assert isinstance(out, CacheRebuildBackendMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.ram_bytes, out.mode) == (
-        "r1", None, 256, 64 << 30, "drain",
+    assert (
+        out.request_id,
+        out.moe_cache_size,
+        out.num_pages,
+        out.ram_bytes,
+        out.controller_enabled,
+        out.controller_limits,
+        out.mode,
+    ) == (
+        "r1",
+        None,
+        256,
+        64 << 30,
+        True,
+        {"microbatch_tokens": 128},
+        "drain",
     )
 
 

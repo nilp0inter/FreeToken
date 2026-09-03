@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter, OrderedDict, deque
+from collections.abc import Iterable
+from concurrent.futures import Future
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator
 
@@ -293,6 +297,36 @@ class OffloadMoeCache:
         self._bounded_usage: list[int] = []
         self._bounded_step = 0
         self._bounded_staging_copy_event: torch.cuda.Event | None = None
+        self._bounded_transfer_stream: torch.cuda.Stream | None = None
+        self._bounded_slot_events: list[torch.cuda.Event] = []
+        self._bounded_active_capacity = self.cache_size
+        self._bounded_free_slots: deque[int] = deque()
+        self._bounded_probation: OrderedDict[int, None] = OrderedDict()
+        self._bounded_protected: OrderedDict[int, None] = OrderedDict()
+        self._bounded_protected_limit = 1
+        self._bounded_dense_start: int | None = None
+        self._bounded_static = False
+        self._bounded_dense_threshold = float(
+            os.getenv("FREETOKEN_MOE_DENSE_PREFILL_THRESHOLD", "0.75")
+        )
+        self._bounded_prefill_cost = {
+            "sparse_ns": 0,
+            "sparse_experts": 0,
+            "dense_ns": 0,
+            "dense_experts": 0,
+        }
+        self._bounded_prefill_modes = {"sparse": 0, "dense": 0}
+        self.execution_signature = ""
+        self._host_prefetches: dict[int, Future[tuple[int, int]]] = {}
+        self._route_transitions: dict[
+            tuple[int, int], Counter[int]
+        ] = {}
+        self._last_routes: tuple[int, list[int]] | None = None
+        self._controller_enabled = True
+        self._controller_limits = {
+            "prefetch_experts": 16,
+            "microbatch_tokens": 256,
+        }
 
     def set_bank_sources(
         self,
@@ -376,6 +410,12 @@ class OffloadMoeCache:
         self.bank_caches = {}
         self.layer_residency = ["nvme"] * self.num_layers
         self._unpinned_layers = frozenset()
+        fingerprint = host_cache.store.reader.meta("fingerprint") or ""
+        self.execution_signature = (
+            f"{host_cache.store.path}:{fingerprint}:"
+            f"{host_cache.store.quant_format}:{self.num_layers}:"
+            f"{self.num_experts}"
+        )
         for name in self.bank_schema:
             spec = host_cache.store.bank_specs[name]
             self.bank_caches[name] = torch.empty(
@@ -383,13 +423,35 @@ class OffloadMoeCache:
                 dtype=spec.dtype,
                 device=self.device,
             )
-        self.banks = [([], self.bank_caches[name]) for name in self.bank_schema]
+        self.banks = [
+            ([], self.bank_caches[name]) for name in self.bank_schema
+        ]
+        if self.cache_size >= 2 * self.num_experts and host_cache.has_layer_staging:
+            self._bounded_dense_start = self.cache_size - self.num_experts
+        else:
+            self._bounded_dense_start = None
+        persistent_capacity = (
+            self._bounded_dense_start
+            if self._bounded_dense_start is not None
+            else self.cache_size
+        )
+        self._bounded_active_capacity = persistent_capacity
+        if host_cache.capacity < self._bounded_active_capacity:
+            raise ValueError(
+                "bounded MoE RAM cache must hold one host backing row per "
+                f"persistent GPU slot ({host_cache.capacity} < "
+                f"{self._bounded_active_capacity})"
+            )
         self._copy_fused_ok = False
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
         if self.device.type == "cuda":
             self._bounded_staging_copy_event = torch.cuda.Event()
+            self._bounded_transfer_stream = torch.cuda.Stream(device=self.device)
+            self._bounded_slot_events = [
+                torch.cuda.Event() for _ in range(self.cache_size)
+            ]
         self._reset_bounded_state()
 
     @property
@@ -402,33 +464,324 @@ class OffloadMoeCache:
             for source in self.bank_sources.values()
         )
 
+    def _clear_bounded_gpu_pins(self) -> None:
+        if self.ram_cache is None:
+            return
+        for slot_id in range(self._bounded_active_capacity):
+            if (
+                slot_id < len(self._bounded_id_of_slot)
+                and self._bounded_id_of_slot[slot_id] >= 0
+            ):
+                self.ram_cache.unpin_gpu(slot_id)
+
     def _reset_bounded_state(self) -> None:
         if self.ram_cache is None:
             return
+        self._bounded_static = False
         self._bounded_slot_for_id = [
             [-1] * self.num_experts for _ in range(self.num_layers)
         ]
         self._bounded_id_of_slot = [-1] * self.cache_size
         self._bounded_usage = [0] * self.cache_size
         self._bounded_step = 0
+        reserved_count = min(self.num_layers, self._bounded_active_capacity)
+        self._bounded_reserved_slots = {
+            layer_id: layer_id for layer_id in range(reserved_count)
+        }
+        self._bounded_reserved_set = set(self._bounded_reserved_slots.values())
+        self._bounded_pending_slots: set[int] = set()
+        self._bounded_layer_counts = [0] * self.num_layers
+        self._bounded_free_slots = deque(range(self._bounded_active_capacity))
+        self._bounded_probation.clear()
+        self._bounded_protected.clear()
+        shared_capacity = self._bounded_active_capacity - reserved_count
+        self._bounded_protected_limit = max(1, int(shared_capacity * 0.8))
         self.slot_for_id.fill_(-1)
         self.id_of_slot.fill_(-1)
         self.usage.zero_()
         self.step.zero_()
+    @property
+    def can_enable_static_graphs(self) -> bool:
+        total_experts = self.num_layers * self.num_experts
+        return (
+            self.ram_cache is not None
+            and self.cache_size >= total_experts
+            and self.ram_cache.capacity >= total_experts
+        )
+
+    def enable_static_graphs(self) -> None:
+        if not self.can_enable_static_graphs:
+            raise ValueError(
+                "bounded CUDA graphs require VRAM and RAM capacity for every "
+                "model expert"
+            )
+        self._cancel_host_prefetches()
+        self._clear_bounded_gpu_pins()
+        self._bounded_dense_start = None
+        self._bounded_active_capacity = self.cache_size
+        self._reset_bounded_state()
+        for layer_id in range(self.num_layers):
+            expert_ids = torch.arange(
+                self.num_experts,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._ensure_experts_bounded(
+                layer_id, expert_ids, phase="prefetch"
+            )
+        self._bounded_static = True
+
+    def _cancel_host_prefetches(self) -> None:
+        futures = list(self._host_prefetches.values())
+        self._host_prefetches.clear()
+        for future in futures:
+            future.cancel()
+        for future in futures:
+            try:
+                future.result()
+            except Exception:
+                pass
+
+    def schedule_host_prefetch(
+        self, layer_id: int, expert_ids: Iterable[int]
+    ) -> None:
+        if (
+            not self._controller_enabled
+            or self.ram_cache is None
+            or not 0 <= layer_id < self.num_layers
+        ):
+            return
+        ids = tuple(
+            dict.fromkeys(
+                expert_id
+                for expert_id in (int(value) for value in expert_ids)
+                if 0 <= expert_id < self.num_experts
+            )
+        )[: self._controller_limits["prefetch_experts"]]
+        if not ids:
+            return
+        current = self._host_prefetches.get(layer_id)
+        if current is not None and not current.done():
+            return
+        self._host_prefetches[layer_id] = self.ram_cache.submit_prefetch(
+            layer_id, ids
+        )
+
+    def prepare_prefix_experts(
+        self,
+        summary: dict[int, tuple[int, ...]],
+        execution_signature: str,
+    ) -> None:
+        if execution_signature != self.execution_signature:
+            return
+        for layer_id in sorted(summary):
+            self.schedule_host_prefetch(layer_id, summary[layer_id])
+
+    def _wait_host_prefetch(self, layer_id: int) -> None:
+        future = self._host_prefetches.pop(layer_id, None)
+        if future is None:
+            return
+        try:
+            future.result()
+        except Exception:
+            # Speculative work must not turn a recoverable demand read into a
+            # request failure. get_many rolls back every reserved slot.
+            return
+
+    def _update_route_predictor(
+        self, layer_id: int, raw_ids: list[int]
+    ) -> None:
+        previous = self._last_routes
+        if previous is not None and previous[0] + 1 == layer_id:
+            for source, target in zip(previous[1], raw_ids):
+                counter = self._route_transitions.setdefault(
+                    (previous[0], source), Counter()
+                )
+                counter[target] += 1
+                if len(counter) > 16:
+                    for value, _ in counter.most_common()[16:]:
+                        del counter[value]
+
+        if layer_id + 1 < self.num_layers:
+            candidates: Counter[int] = Counter()
+            for source in raw_ids:
+                counter = self._route_transitions.get((layer_id, source))
+                if not counter:
+                    continue
+                target, count = counter.most_common(1)[0]
+                # Fetch only when the expected avoided demand latency exceeds
+                # the expected wasted read latency.
+                if count * 2 >= counter.total():
+                    candidates[target] += count
+            if candidates:
+                self.schedule_host_prefetch(
+                    layer_id + 1,
+                    (
+                        expert
+                        for expert, _ in candidates.most_common(
+                            self._controller_limits["prefetch_experts"]
+                        )
+                    ),
+                )
+        self._last_routes = (layer_id, raw_ids)
+
+
+    def validate_controller_limits(
+        self, limits: dict[str, int] | None
+    ) -> dict[str, int]:
+        proposed = dict(self._controller_limits)
+        for name, value in (limits or {}).items():
+            if name not in proposed:
+                raise ValueError(f"unknown cache controller limit {name!r}")
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"cache controller limit {name!r} must be a positive integer"
+                )
+            proposed[name] = value
+        return proposed
+
+    def configure_controller(
+        self,
+        *,
+        enabled: bool | None = None,
+        limits: dict[str, int] | None = None,
+    ) -> None:
+        proposed = self.validate_controller_limits(limits)
+        self._controller_limits = proposed
+        if enabled is not None:
+            self._controller_enabled = bool(enabled)
+        if not self._controller_enabled:
+            self._cancel_host_prefetches()
+
+    def _controller_snapshot(self, host: dict) -> dict:
+        disk_bytes = int(host["disk_bytes"])
+        disk_ns = float(host["disk_latency_us"]) * 1000.0
+        vram_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.bank_caches.values()
+        )
+        dense_slots = (
+            self.num_experts if self._bounded_dense_start is not None else 0
+        )
+        persistent_slots = self._bounded_active_capacity
+        metadata_bytes = (
+            self.num_layers * self.num_experts * 4
+            + self.cache_size * 12
+            + sum(len(counter) * 8 for counter in self._route_transitions.values())
+        )
+        sparse_experts = self._bounded_prefill_cost["sparse_experts"]
+        dense_experts = self._bounded_prefill_cost["dense_experts"]
+        sparse_ns = (
+            self._bounded_prefill_cost["sparse_ns"] / sparse_experts
+            if sparse_experts
+            else 0.0
+        )
+        dense_ns = (
+            self._bounded_prefill_cost["dense_ns"] / dense_experts
+            if dense_experts
+            else 0.0
+        )
+        metrics = host["metrics"]
+        transfer_bytes = sum(
+            int(row["bytes"])
+            for row in metrics["rows"]
+            if row["tier"] == "vram"
+        )
+        transfer_ns = int(metrics["wait_ns"].get("vram", 0))
+        benefit = {
+            "ram_expert": disk_ns / disk_bytes if disk_bytes else 0.0,
+            "dense_staging": max(0.0, sparse_ns - dense_ns)
+            / max(1, self.num_experts * self.expert_bytes_per_slot),
+            "transfer": (
+                transfer_ns / transfer_bytes if transfer_bytes else 0.0
+            ),
+        }
+        crossover_density = (
+            min(1.0, max(0.0, dense_ns / sparse_ns))
+            if sparse_ns and dense_ns
+            else self._bounded_dense_threshold
+        )
+        return {
+            "enabled": self._controller_enabled,
+            "limits": dict(self._controller_limits),
+            "static_graph_slots": self._bounded_static,
+            "prefill_policy": {
+                "configured_dense_threshold": self._bounded_dense_threshold,
+                "measured_crossover_density": crossover_density,
+                "sparse_ns_per_expert": sparse_ns,
+                "dense_ns_per_expert": dense_ns,
+                "sparse_experts_measured": sparse_experts,
+                "dense_experts_measured": dense_experts,
+                "selections": dict(self._bounded_prefill_modes),
+            },
+            "arenas": {
+                "vram": {
+                    "physical_bytes": vram_bytes,
+                    "persistent_bytes": (
+                        persistent_slots * self.expert_bytes_per_slot
+                    ),
+                    "dense_staging_bytes": (
+                        dense_slots * self.expert_bytes_per_slot
+                    ),
+                    "addresses": [
+                        tensor.data_ptr()
+                        for tensor in self.bank_caches.values()
+                    ],
+                },
+                "host": host["arenas"],
+                "metadata": {"bytes": metadata_bytes},
+            },
+            "marginal_benefit_ns_per_byte": benefit,
+            "ownership_priority": sorted(
+                benefit, key=lambda name: (-benefit[name], name)
+            ),
+        }
 
     def ram_cache_status(self) -> dict | None:
-        return self.ram_cache.status() if self.ram_cache is not None else None
+        if self.ram_cache is None:
+            return None
+        status = self.ram_cache.status()
+        status["controller"] = self._controller_snapshot(status)
+        return status
 
     def rebuild_ram_cache(self, host_budget_bytes: int, *, per_rank_budget_bytes: int) -> None:
         """Resize the bounded host arena without touching GPU cache geometry."""
         if self.ram_cache is None:
             raise ValueError("bounded MoE RAM cache is not enabled")
+        restore_static = self._bounded_static
+        required_capacity = (
+            self.cache_size
+            if restore_static or self._bounded_dense_start is None
+            else self._bounded_dense_start
+        )
+        target_capacity = self.ram_cache.validate_per_rank_budget(
+            per_rank_budget_bytes
+        )
+        if target_capacity < required_capacity:
+            raise ValueError(
+                "resized RAM cache cannot back every persistent GPU slot "
+                f"({target_capacity} < {required_capacity})"
+            )
+        self._cancel_host_prefetches()
+        self._clear_bounded_gpu_pins()
         self.ram_cache.resize(
             per_rank_budget_bytes,
             host_budget_bytes=host_budget_bytes,
             requested=host_budget_bytes,
         )
+        persistent_capacity = (
+            self._bounded_dense_start
+            if self._bounded_dense_start is not None
+            else self.cache_size
+        )
+        if self.ram_cache.capacity < persistent_capacity:
+            raise ValueError(
+                "resized RAM cache cannot back every persistent GPU slot"
+            )
+        self._bounded_active_capacity = persistent_capacity
         self._reset_bounded_state()
+        if restore_static:
+            self.enable_static_graphs()
 
 
     def _build_copy_plan(self) -> None:
@@ -519,6 +872,14 @@ class OffloadMoeCache:
         """
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
+        if (
+            getattr(self, "_bounded_static", False)
+            and cache_size < self.num_layers * self.num_experts
+        ):
+            raise ValueError(
+                "cannot shrink a graph-stable bounded cache below full expert "
+                "residency"
+            )
         if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
@@ -539,6 +900,29 @@ class OffloadMoeCache:
             "set_bank_sources or set_bounded_host_cache must run before rebuild"
         )
         self.validate_rebuild(cache_size)
+        dense_start: int | None = None
+        persistent_capacity = cache_size
+        restore_static = self._bounded_static
+        if self.ram_cache is not None:
+            dense_start = (
+                None
+                if restore_static
+                else (
+                    cache_size - self.num_experts
+                    if cache_size >= 2 * self.num_experts
+                    and self.ram_cache.has_layer_staging
+                    else None
+                )
+            )
+            persistent_capacity = (
+                dense_start if dense_start is not None else cache_size
+            )
+            if self.ram_cache.capacity < persistent_capacity:
+                raise ValueError(
+                    "RAM cache cannot back every rebuilt persistent GPU slot"
+                )
+        if self.ram_cache is not None:
+            self._clear_bounded_gpu_pins()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self.prefill_copy_stream = None
@@ -564,6 +948,13 @@ class OffloadMoeCache:
                     dtype=spec.dtype,
                     device=self.device,
                 )
+            if self.device.type == "cuda":
+                self._bounded_transfer_stream = torch.cuda.Stream(
+                    device=self.device
+                )
+                self._bounded_slot_events = [
+                    torch.cuda.Event() for _ in range(cache_size)
+                ]
             self.banks = [([], self.bank_caches[n]) for n in self.bank_schema]
         else:
             for name in self.bank_schema:
@@ -578,6 +969,8 @@ class OffloadMoeCache:
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
         if self.ram_cache is not None:
+            self._bounded_dense_start = dense_start
+            self._bounded_active_capacity = persistent_capacity
             self._reset_bounded_state()
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -601,6 +994,8 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
+        if restore_static:
+            self.enable_static_graphs()
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
             logger.warning(
@@ -918,161 +1313,409 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def _bounded_gpu_victim(self) -> int:
-        free = [i for i, flat_id in enumerate(self._bounded_id_of_slot) if flat_id < 0]
-        if free:
-            return free[0]
-        return min(range(self.cache_size), key=lambda i: (self._bounded_usage[i], i))
-
-    def _bounded_install(self, layer_id: int, expert_id: int, slot_id: int) -> None:
-        old_flat = self._bounded_id_of_slot[slot_id]
-        if old_flat >= 0:
-            old_layer, old_expert = divmod(old_flat, self.num_experts)
-            self._bounded_slot_for_id[old_layer][old_expert] = -1
-            self.slot_for_id[old_layer, old_expert] = -1
-        flat_id = layer_id * self.num_experts + expert_id
-        old_slot = self._bounded_slot_for_id[layer_id][expert_id]
-        if old_slot >= 0 and old_slot != slot_id:
-            self._bounded_id_of_slot[old_slot] = -1
-            self.id_of_slot[old_slot] = -1
-        self._bounded_slot_for_id[layer_id][expert_id] = slot_id
-        self._bounded_id_of_slot[slot_id] = flat_id
+    def _bounded_touch(self, slot_id: int) -> None:
         self._bounded_step += 1
         self._bounded_usage[slot_id] = self._bounded_step
+        self.usage[slot_id] = self._bounded_step
+        flat_id = self._bounded_id_of_slot[slot_id]
+        if (
+            slot_id in self._bounded_reserved_set
+            and flat_id >= 0
+            and flat_id // self.num_experts == slot_id
+        ):
+            return
+        if slot_id in self._bounded_protected:
+            self._bounded_protected.move_to_end(slot_id)
+            return
+        self._bounded_probation.pop(slot_id, None)
+        self._bounded_protected[slot_id] = None
+        if len(self._bounded_protected) > self._bounded_protected_limit:
+            demoted, _ = self._bounded_protected.popitem(last=False)
+            self._bounded_probation[demoted] = None
+
+    def _bounded_evict_slot(self, slot_id: int, phase: str) -> int:
+        assert self.ram_cache is not None
+        old_flat = self._bounded_id_of_slot[slot_id]
+        if old_flat < 0:
+            raise RuntimeError("bounded GPU victim has no resident expert")
+        old_layer, old_expert = divmod(old_flat, self.num_experts)
+        self._bounded_slot_for_id[old_layer][old_expert] = -1
+        self._bounded_layer_counts[old_layer] -= 1
+        self.slot_for_id[old_layer, old_expert] = -1
+        self._bounded_id_of_slot[slot_id] = -1
+        self.id_of_slot[slot_id] = -1
+        self.ram_cache.unpin_gpu(slot_id)
+        self.ram_cache.telemetry.record(
+            phase, old_layer, "vram", "evictions"
+        )
+        self._bounded_pending_slots.add(slot_id)
+        return slot_id
+
+    def _bounded_gpu_victim(self, layer_id: int, phase: str) -> int:
+        reserved_slot = self._bounded_reserved_slots.get(layer_id)
+        if (
+            reserved_slot is not None
+            and reserved_slot not in self._bounded_pending_slots
+        ):
+            old_flat = self._bounded_id_of_slot[reserved_slot]
+            if old_flat < 0:
+                self._bounded_pending_slots.add(reserved_slot)
+                return reserved_slot
+            if old_flat // self.num_experts != layer_id:
+                self._bounded_probation.pop(reserved_slot, None)
+                self._bounded_protected.pop(reserved_slot, None)
+                return self._bounded_evict_slot(reserved_slot, phase)
+        while self._bounded_free_slots:
+            slot_id = self._bounded_free_slots.popleft()
+            if (
+                slot_id in self._bounded_pending_slots
+                or self._bounded_id_of_slot[slot_id] >= 0
+            ):
+                continue
+            self._bounded_pending_slots.add(slot_id)
+            return slot_id
+        if self._bounded_probation:
+            slot_id, _ = self._bounded_probation.popitem(last=False)
+        elif self._bounded_protected:
+            slot_id, _ = self._bounded_protected.popitem(last=False)
+        else:
+            raise RuntimeError("bounded GPU cache has no eviction victim")
+        return self._bounded_evict_slot(slot_id, phase)
+
+    def _release_bounded_reservations(self, slot_ids: list[int]) -> None:
+        for slot_id in reversed(slot_ids):
+            self._bounded_pending_slots.discard(slot_id)
+            if (
+                slot_id not in self._bounded_reserved_set
+                and self._bounded_id_of_slot[slot_id] < 0
+            ):
+                self._bounded_free_slots.appendleft(slot_id)
+
+    def _bounded_install(
+        self,
+        layer_id: int,
+        expert_id: int,
+        slot_id: int,
+        handle,
+        phase: str,
+    ) -> None:
+        ram_cache = self.ram_cache
+        assert ram_cache is not None
+        if self._bounded_id_of_slot[slot_id] >= 0:
+            raise RuntimeError("bounded GPU publication requires a free slot")
+        flat_id = layer_id * self.num_experts + expert_id
+        ram_cache.pin_for_gpu(handle, slot_id)
+        self._bounded_slot_for_id[layer_id][expert_id] = slot_id
+        self._bounded_id_of_slot[slot_id] = flat_id
         self.slot_for_id[layer_id, expert_id] = slot_id
         self.id_of_slot[slot_id] = flat_id
+        self._bounded_layer_counts[layer_id] += 1
+        self._bounded_pending_slots.discard(slot_id)
+        if (
+            slot_id not in self._bounded_reserved_set
+            or slot_id != layer_id
+        ):
+            self._bounded_probation[slot_id] = None
+        self._bounded_step += 1
+        self._bounded_usage[slot_id] = self._bounded_step
         self.usage[slot_id] = self._bounded_step
+        ram_cache.telemetry.record(
+            phase,
+            layer_id,
+            "vram",
+            "admissions",
+            nbytes=self.expert_bytes_per_slot,
+            expert_id=expert_id,
+        )
 
-    def _copy_bounded_handle(self, handle, slot_id: int, *, non_blocking: bool = False) -> None:
+    def _copy_bounded_handle(
+        self,
+        handle,
+        slot_id: int,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
         for name in self.bank_schema:
             self.bank_caches[name][slot_id].copy_(
                 handle.tensors[name], non_blocking=non_blocking
             )
 
-    def _ensure_experts_bounded(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def _ensure_experts_bounded(
+        self,
+        layer_id: int,
+        expert_ids: torch.Tensor,
+        *,
+        phase: str,
+    ) -> None:
+        operation_started = time.perf_counter_ns()
         assert self.ram_cache is not None
-        raw_ids = [int(value) for value in expert_ids.detach().cpu().reshape(-1).tolist()]
-        self.ram_cache.record_accesses(layer_id, raw_ids)
-        unique_ids = list(dict.fromkeys(raw_ids))
-        missing_ids = [
-            expert_id
-            for expert_id in unique_ids
-            if self._bounded_slot_for_id[layer_id][expert_id] < 0
+        if self._bounded_static:
+            slots = self.slot_for_id[layer_id].gather(
+                0, expert_ids.reshape(-1).long()
+            )
+            expert_ids.copy_(
+                slots.to(dtype=expert_ids.dtype).reshape_as(expert_ids)
+            )
+            self.num_indices.zero_()
+            self.num_missing_full.zero_()
+            return
+        self._wait_host_prefetch(layer_id)
+        raw_ids = [
+            int(value) for value in expert_ids.detach().cpu().reshape(-1).tolist()
         ]
-        missing = len(missing_ids)
-        handles, bypass_ids = self.ram_cache.get_many(
-            layer_id,
-            missing_ids,
-            observe=False,
-        )
-        bypass_set = set(bypass_ids)
-        in_flight = list(handles.values())
+        self.ram_cache.record_accesses(layer_id, raw_ids, phase=phase)
+        unique_ids = list(dict.fromkeys(raw_ids))
+        missing_ids = []
+        for expert_id in unique_ids:
+            slot_id = self._bounded_slot_for_id[layer_id][expert_id]
+            self.ram_cache.telemetry.record(
+                phase, layer_id, "vram", "requests"
+            )
+            if slot_id >= 0:
+                self._bounded_touch(slot_id)
+                self.ram_cache.telemetry.record(
+                    phase, layer_id, "vram", "hits"
+                )
+            else:
+                missing_ids.append(expert_id)
+                self.ram_cache.telemetry.record(
+                    phase, layer_id, "vram", "misses"
+                )
+
+        reserved_slots = [
+            self._bounded_gpu_victim(layer_id, phase) for _ in missing_ids
+        ]
         try:
-            for expert_id in unique_ids:
-                slot_id = self._bounded_slot_for_id[layer_id][expert_id]
-                if slot_id >= 0:
-                    self._bounded_step += 1
-                    self._bounded_usage[slot_id] = self._bounded_step
-                    self.usage[slot_id] = self._bounded_step
-                    continue
-                slot_id = self._bounded_gpu_victim()
-                handle = handles.get(expert_id)
-                if handle is not None:
-                    self._copy_bounded_handle(
-                        handle,
-                        slot_id,
-                        non_blocking=self.device.type == "cuda",
+            handles, bypass_ids = self.ram_cache.get_many(
+                layer_id,
+                missing_ids,
+                observe=False,
+                force_admit=True,
+                phase=phase,
+            )
+        except Exception:
+            self._release_bounded_reservations(reserved_slots)
+            raise
+        if bypass_ids:
+            for handle in handles.values():
+                self.ram_cache.release_in_flight(handle)
+            self._release_bounded_reservations(reserved_slots)
+            raise RuntimeError(
+                "host budget cannot back the requested GPU expert working set"
+            )
+        in_flight = list(handles.values())
+        installed = 0
+        copy_started = time.perf_counter_ns()
+        try:
+            if self.device.type == "cuda":
+                assert self._bounded_transfer_stream is not None
+                with torch.cuda.stream(self._bounded_transfer_stream):
+                    for expert_id, slot_id in zip(
+                        missing_ids, reserved_slots
+                    ):
+                        self._copy_bounded_handle(
+                            handles[expert_id], slot_id, non_blocking=True
+                        )
+                        self._bounded_slot_events[slot_id].record(
+                            self._bounded_transfer_stream
+                        )
+                current_stream = torch.cuda.current_stream(self.device)
+                for slot_id in reserved_slots:
+                    current_stream.wait_event(
+                        self._bounded_slot_events[slot_id]
                     )
-                else:
-                    assert expert_id in bypass_set
-                    handle = self.ram_cache.get(layer_id, expert_id, observe=False)
-                    try:
-                        self._copy_bounded_handle(handle, slot_id)
-                    finally:
-                        handle.release()
-                self._bounded_install(layer_id, expert_id, slot_id)
-        finally:
+            else:
+                for expert_id, slot_id in zip(missing_ids, reserved_slots):
+                    self._copy_bounded_handle(handles[expert_id], slot_id)
+            copy_finished = time.perf_counter_ns()
+            for expert_id, slot_id in zip(missing_ids, reserved_slots):
+                self._bounded_install(
+                    layer_id,
+                    expert_id,
+                    slot_id,
+                    handles[expert_id],
+                    phase,
+                )
+                installed += 1
             if in_flight:
-                if self.device.type == "cuda":
-                    torch.cuda.current_stream(self.device).synchronize()
-                for handle in in_flight:
-                    self.ram_cache.release_in_flight(handle)
+                self.ram_cache.telemetry.record(
+                    phase,
+                    layer_id,
+                    "vram",
+                    "requests",
+                    nbytes=len(in_flight) * self.expert_bytes_per_slot,
+                    started_ns=copy_started,
+                    finished_ns=copy_finished,
+                )
+        finally:
+            for handle in in_flight:
+                self.ram_cache.release_in_flight(handle)
+            self._release_bounded_reservations(reserved_slots[installed:])
 
         mapped = [
             self._bounded_slot_for_id[layer_id][expert_id] for expert_id in raw_ids
         ]
         expert_ids.copy_(
-            torch.as_tensor(mapped, dtype=expert_ids.dtype, device=expert_ids.device)
-            .reshape_as(expert_ids)
+            torch.as_tensor(
+                mapped, dtype=expert_ids.dtype, device=expert_ids.device
+            ).reshape_as(expert_ids)
         )
         self.num_indices.zero_()
         self.num_missing_full.zero_()
+
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._update_route_predictor(layer_id, raw_ids)
         if self.collect_stats:
             self.lru_stats[layer_id, Stat.ACTIVE] += len(unique_ids)
-            self.lru_stats[layer_id, Stat.MISS] += missing
+            self.lru_stats[layer_id, Stat.MISS] += len(missing_ids)
             self.lru_stats[layer_id, Stat.CALLS] += 1
+        if phase == "prefill":
+            self._record_bounded_prefill_cost(
+                "sparse",
+                time.perf_counter_ns() - operation_started,
+                len(unique_ids),
+            )
+    def bounded_gpu_hit_plan(
+        self, layer_id: int, expert_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, bool, bool]:
+        raw_ids = [
+            int(value) for value in expert_ids.detach().cpu().reshape(-1).tolist()
+        ]
+        slots = [
+            self._bounded_slot_for_id[layer_id][expert_id]
+            for expert_id in raw_ids
+        ]
+        hits = [slot_id >= 0 for slot_id in slots]
+        slot_tensor = torch.as_tensor(
+            [max(0, slot_id) for slot_id in slots],
+            dtype=expert_ids.dtype,
+            device=expert_ids.device,
+        ).reshape_as(expert_ids)
+        hit_mask = torch.as_tensor(
+            hits, dtype=torch.bool, device=expert_ids.device
+        ).reshape_as(expert_ids)
+        return slot_tensor, hit_mask, any(hits), all(hits)
 
-    def _bounded_materialize_layer(self, layer_id: int) -> None:
-        assert self.ram_cache is not None
-        base = layer_id * self.num_experts
-        # Match the GPU materialize kernel: remove every old entry for this
-        # layer, then reserve slots [0, num_experts) for the full prefill row.
-        for slot_id, flat_id in enumerate(self._bounded_id_of_slot):
-            if base <= flat_id < base + self.num_experts:
-                old_layer, old_expert = divmod(flat_id, self.num_experts)
-                self._bounded_id_of_slot[slot_id] = -1
-                self._bounded_slot_for_id[old_layer][old_expert] = -1
-                self.slot_for_id[old_layer, old_expert] = -1
-                self.id_of_slot[slot_id] = -1
-                self.usage[slot_id] = 0
-        for expert_id in range(self.num_experts):
-            self._bounded_slot_for_id[layer_id][expert_id] = -1
-        for slot_id in range(self.num_experts):
-            old_flat = self._bounded_id_of_slot[slot_id]
-            if old_flat >= 0:
-                old_layer, old_expert = divmod(old_flat, self.num_experts)
-                self._bounded_slot_for_id[old_layer][old_expert] = -1
-                self.slot_for_id[old_layer, old_expert] = -1
-            self._bounded_id_of_slot[slot_id] = base + slot_id
-            self._bounded_slot_for_id[layer_id][slot_id] = slot_id
-            self._bounded_step += 1
-            self._bounded_usage[slot_id] = self._bounded_step
-            self.id_of_slot[slot_id] = base + slot_id
-            self.slot_for_id[layer_id, slot_id] = slot_id
-            self.usage[slot_id] = self._bounded_step
-        if self.ram_cache.has_layer_staging:
-            if self._bounded_staging_copy_event is not None:
-                self._bounded_staging_copy_event.synchronize()
-            staging = self.ram_cache.load_layer(layer_id)
-            non_blocking = self.device.type == "cuda"
-            for name in self.bank_schema:
-                self.bank_caches[name][: self.num_experts].copy_(
-                    staging[name],
-                    non_blocking=non_blocking,
+    def _record_bounded_prefill_cost(
+        self, mode: str, elapsed_ns: int, expert_count: int
+    ) -> None:
+        self._bounded_prefill_cost[f"{mode}_ns"] += int(elapsed_ns)
+        self._bounded_prefill_cost[f"{mode}_experts"] += max(
+            1, int(expert_count)
+        )
+
+    def bounded_prefill_mode(self, expert_ids: torch.Tensor) -> str:
+        mode = "sparse"
+        if self.ram_cache is not None and self._bounded_dense_start is not None:
+            active = torch.unique(expert_ids).numel()
+            density = active / self.num_experts
+            sparse_experts = self._bounded_prefill_cost["sparse_experts"]
+            dense_experts = self._bounded_prefill_cost["dense_experts"]
+            if sparse_experts and not dense_experts:
+                if density >= self._bounded_dense_threshold:
+                    mode = "dense"
+            elif sparse_experts and dense_experts:
+                sparse_estimate = (
+                    self._bounded_prefill_cost["sparse_ns"]
+                    / sparse_experts
+                    * active
                 )
-            if self._bounded_staging_copy_event is not None:
-                self._bounded_staging_copy_event.record(torch.cuda.current_stream(self.device))
-        else:
-            for expert_id in range(self.num_experts):
-                handle = self.ram_cache.get(layer_id, expert_id, prefill=True)
-                try:
-                    self._copy_bounded_handle(handle, expert_id)
-                finally:
-                    handle.release()
-        self.num_indices.fill_(self.num_experts)
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = True
+                dense_estimate = (
+                    self._bounded_prefill_cost["dense_ns"]
+                    / dense_experts
+                    * self.num_experts
+                )
+                if dense_estimate < sparse_estimate:
+                    mode = "dense"
+        self._bounded_prefill_modes[mode] += 1
+        return mode
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
+    def bounded_prefill_microbatch_tokens(self, num_tokens: int) -> int:
+        limit = self._controller_limits["microbatch_tokens"]
+        if (
+            not self._controller_enabled
+            or self.ram_cache is None
+            or num_tokens <= limit
+        ):
+            return num_tokens
+        status = self.ram_cache.status()
+        reads = int(status["disk_reads"])
+        average_read_ns = (
+            float(status["disk_latency_us"]) * 1000.0 / reads
+            if reads
+            else 0.0
+        )
+        if average_read_ns < 50_000:
+            return num_tokens
+        return min(limit, max(1, num_tokens // 2))
+
+
+    def bounded_dense_layer(
+        self, layer_id: int, expert_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        assert self.ram_cache is not None
+        self._wait_host_prefetch(layer_id)
+        if self._bounded_dense_start is None:
+            raise RuntimeError("bounded dense staging arena is unavailable")
+        self.ram_cache.record_accesses(
+            layer_id,
+            (int(value) for value in expert_ids.detach().cpu().reshape(-1)),
+            phase="prefill",
+        )
+        operation_started = time.perf_counter_ns()
+        staging = self.ram_cache.load_layer(layer_id, phase="prefill")
+        start = self._bounded_dense_start
+        finished = start + self.num_experts
+        copy_started = time.perf_counter_ns()
+        if self.device.type == "cuda":
+            assert self._bounded_transfer_stream is not None
+            assert self._bounded_staging_copy_event is not None
+            with torch.cuda.stream(self._bounded_transfer_stream):
+                for name in self.bank_schema:
+                    self.bank_caches[name][start:finished].copy_(
+                        staging[name], non_blocking=True
+                    )
+                self._bounded_staging_copy_event.record(
+                    self._bounded_transfer_stream
+                )
+            torch.cuda.current_stream(self.device).wait_event(
+                self._bounded_staging_copy_event
+            )
+        else:
+            for name in self.bank_schema:
+                self.bank_caches[name][start:finished].copy_(staging[name])
+        self.ram_cache.telemetry.record(
+            "prefill",
+            layer_id,
+            "vram",
+            "requests",
+            nbytes=self.num_experts * self.expert_bytes_per_slot,
+            started_ns=copy_started,
+            finished_ns=time.perf_counter_ns(),
+        )
+        self._record_bounded_prefill_cost(
+            "dense",
+            time.perf_counter_ns() - operation_started,
+            self.num_experts,
+        )
+        return tuple(
+            self.bank_caches[name][start:finished] for name in self.bank_schema
+        )
+
+
+    def ensure_experts(
+        self,
+        layer_id: int,
+        expert_ids: torch.Tensor,
+        *,
+        phase: str = "decode",
+    ) -> None:
+        if self.collect_decode_freq and phase == "decode":
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         if self.ram_cache is not None:
-            self._ensure_experts_bounded(layer_id, expert_ids)
+            self._ensure_experts_bounded(layer_id, expert_ids, phase=phase)
             return
         from freetoken.moe.offload_kernels import ensure_experts
 
@@ -1105,8 +1748,10 @@ class OffloadMoeCache:
 
     def materialize_layer(self, layer_id: int) -> None:
         if self.ram_cache is not None:
-            self._bounded_materialize_layer(layer_id)
-            return
+            raise RuntimeError(
+                "bounded prefill materializes routed experts or the dense "
+                "staging arena directly"
+            )
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
@@ -1115,6 +1760,7 @@ class OffloadMoeCache:
 
     def reset(self) -> None:
         if self.ram_cache is not None:
+            self._clear_bounded_gpu_pins()
             self._reset_bounded_state()
             self.expert_recency.fill_(-1)
             return

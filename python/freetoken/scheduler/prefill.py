@@ -186,6 +186,14 @@ class PrefillAdder:
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
         )
+        node = getattr(cache_handle, "node", None)
+        if node is not None:
+            req.moe_demand_summary = dict(
+                getattr(node, "expert_summary", None) or {}
+            )
+            req.moe_execution_signature = (
+                getattr(node, "expert_signature", None) or ""
+            )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx

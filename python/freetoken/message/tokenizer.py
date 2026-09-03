@@ -48,6 +48,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Compact bounded-cache snapshot on the terminal token only.
+    ram_cache: Dict[str, Any] | None = None
 
 
 @dataclass
@@ -88,6 +90,8 @@ class CacheRebuildMsg(BaseTokenizerMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     ram_bytes: int | None = None
+    controller_enabled: bool | None = None
+    controller_limits: Dict[str, int] | None = None
     mode: str = "if_idle"
 
 

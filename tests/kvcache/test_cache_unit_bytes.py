@@ -292,3 +292,19 @@ def test_status_meta_includes_pools():
     meta = compute_cache_status_meta(eng)
     assert meta["pools"]["num_pages"] == 100
     assert meta["pools"]["page_size"] == 16
+
+
+def test_status_meta_uses_consistent_controller_snapshot():
+    eng = _mha_engine()
+    eng.config = _config()
+    expected = {
+        "mode": "bounded",
+        "controller": {"enabled": True, "limits": {"prefetch_experts": 8}},
+    }
+    eng.moe_offload_cache = SimpleNamespace(
+        cache_size=3,
+        bank_caches={},
+        ram_cache_status=lambda: expected,
+    )
+
+    assert compute_cache_status_meta(eng)["ram_cache"] is expected

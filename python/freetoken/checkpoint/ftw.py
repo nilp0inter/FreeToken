@@ -116,18 +116,30 @@ class FTWWriter:
     aligned). Call :meth:`add_tensor` for each tensor, then :meth:`finalize`.
     """
 
-    def __init__(self, out_dir: str, *, shard_limit: int = DEFAULT_SHARD_LIMIT):
+    def __init__(
+        self,
+        out_dir: str,
+        *,
+        shard_limit: int = DEFAULT_SHARD_LIMIT,
+        expert_devices: tuple[str, ...] = (),
+    ):
         assert shard_limit % ALIGN == 0, "shard_limit must be a multiple of ALIGN"
         os.makedirs(out_dir, exist_ok=True)
         self.out_dir = out_dir
         self.shard_limit = shard_limit
         self._tensors: list[dict] = []
         self._shards: list[dict] = []
-        self._global = 0  # running FTW offset (incl. padding)
-        self._f = None  # current shard file handle
+        self._global = 0
+        self._f = None
         self._shard_idx = -1
-        self._shard_start = 0  # FTW offset where the current shard began
-        self._cur = 0  # bytes written to the current shard
+        self._shard_start = 0
+        self._cur = 0
+        self._expert_pages: list[dict] = []
+        self._expert_layer_extents: dict[int, dict] = {}
+        self._expert_devices = expert_devices or ("default",)
+        self._expert_device_offsets = {
+            device: 0 for device in self._expert_devices
+        }
 
     def _roll(self) -> None:
         if self._f is not None:
@@ -172,15 +184,102 @@ class FTWWriter:
         if pad:
             self._write_raw(memoryview(bytes(pad)))
 
+    def add_expert_layer(
+        self, layer_id: int, banks: dict[str, torch.Tensor]
+    ) -> None:
+        if not banks:
+            raise ValueError("expert page requires at least one bank")
+        tensors = {
+            name: tensor.detach().cpu().contiguous()
+            for name, tensor in banks.items()
+        }
+        expert_counts = {tensor.shape[0] for tensor in tensors.values()}
+        if len(expert_counts) != 1:
+            raise ValueError("expert page banks have inconsistent expert counts")
+        num_experts = expert_counts.pop()
+        first_page = len(self._expert_pages)
+        for expert_id in range(num_experts):
+            bank_meta = []
+            offset = 0
+            rows = {}
+            for name, tensor in tensors.items():
+                row = tensor[expert_id].contiguous()
+                raw = row.reshape(-1).view(torch.uint8)
+                rows[name] = raw
+                nbytes = int(raw.numel())
+                bank_meta.append(
+                    {
+                        "name": name,
+                        "offset": offset,
+                        "nbytes": nbytes,
+                        "dtype": _dtype_str(row.dtype),
+                        "shape": list(row.shape),
+                    }
+                )
+                offset += nbytes
+            page = torch.empty(offset, dtype=torch.uint8)
+            for item in bank_meta:
+                start = item["offset"]
+                page[start : start + item["nbytes"]].copy_(rows[item["name"]])
+            global_off = self._global
+            name = f"expert_page#L{layer_id:05d}#E{expert_id:05d}"
+            self.add_tensor(name, page, kind="expert_page")
+            page_index = len(self._expert_pages)
+            device = self._expert_devices[
+                page_index % len(self._expert_devices)
+            ]
+            device_offset = self._expert_device_offsets[device]
+            self._expert_device_offsets[device] += _align_up(offset)
+            self._expert_pages.append(
+                {
+                    "layer": int(layer_id),
+                    "expert": int(expert_id),
+                    "global_off": global_off,
+                    "nbytes": offset,
+                    "banks": bank_meta,
+                    "device": device,
+                    "device_offset": device_offset,
+                }
+            )
+        pages = self._expert_pages[first_page:]
+        self._expert_layer_extents[int(layer_id)] = {
+            "first_page": first_page,
+            "page_count": len(pages),
+            "global_off": pages[0]["global_off"],
+            "nbytes": (
+                _align_up(pages[-1]["global_off"] + pages[-1]["nbytes"])
+                - pages[0]["global_off"]
+            ),
+        }
+
     def finalize(self, meta: dict) -> dict:
         if self._f is not None:
             self._shards.append({"file": _SHARD_FMT.format(self._shard_idx),
                                  "global_off": self._shard_start, "nbytes": self._cur})
             self._f.close()
             self._f = None
-        index = {"format": FORMAT_TAG, "version": FORMAT_VERSION, "align": ALIGN,
-                 "shard_limit": self.shard_limit, "total_bytes": self._global,
-                 "tensors": self._tensors, "shards": self._shards, **meta}
+        metadata = dict(meta)
+        if self._expert_pages:
+            metadata["expert_pages"] = {
+                "version": 1,
+                "alignment": ALIGN,
+                "devices": list(self._expert_devices),
+                "layers": {
+                    str(layer): extent
+                    for layer, extent in self._expert_layer_extents.items()
+                },
+                "pages": self._expert_pages,
+            }
+        index = {
+            "format": FORMAT_TAG,
+            "version": FORMAT_VERSION,
+            "align": ALIGN,
+            "shard_limit": self.shard_limit,
+            "total_bytes": self._global,
+            "tensors": self._tensors,
+            "shards": self._shards,
+            **metadata,
+        }
         tmp = os.path.join(self.out_dir, INDEX_NAME + ".tmp")
         with open(tmp, "w") as f:
             json.dump(index, f)
@@ -376,6 +475,66 @@ class FTWReader:
         finally:
             scratch.close()
 
+    def read_ranges_into(
+        self,
+        requests: list[tuple[memoryview, int, int]],
+        *,
+        workers: int = 1,
+        chunk: int = _DEFAULT_CHUNK,
+        max_window: int = _DEFAULT_CHUNK,
+    ) -> int:
+        """Read nearby ranges through bounded coalesced aligned windows."""
+        if not requests:
+            return 0
+        ordered = sorted(requests, key=lambda item: item[1])
+        groups: list[list[tuple[memoryview, int, int]]] = []
+        for request in ordered:
+            destination, offset, nbytes = request
+            if nbytes < 0 or len(destination) < nbytes:
+                raise ValueError("invalid FTW coalesced range")
+            if not groups:
+                groups.append([request])
+                continue
+            group = groups[-1]
+            group_start = group[0][1] // ALIGN * ALIGN
+            group_end = max(
+                item[1] + item[2] for item in group
+            )
+            request_end = offset + nbytes
+            merged_end = _align_up(max(group_end, request_end))
+            if offset <= _align_up(group_end) and (
+                merged_end - group_start <= max_window
+            ):
+                group.append(request)
+            else:
+                groups.append([request])
+
+        physical_bytes = 0
+        for group in groups:
+            start = group[0][1] // ALIGN * ALIGN
+            end = _align_up(max(offset + nbytes for _, offset, nbytes in group))
+            scratch = _transient_buffer(end - start)
+            try:
+                self.read_into(
+                    memoryview(scratch),
+                    {"global_off": start, "nbytes": end - start},
+                    workers=workers,
+                    chunk=chunk,
+                )
+                source = memoryview(scratch)
+                try:
+                    for destination, offset, nbytes in group:
+                        relative = offset - start
+                        destination[:nbytes] = source[
+                            relative : relative + nbytes
+                        ]
+                finally:
+                    source.release()
+            finally:
+                scratch.close()
+            physical_bytes += end - start
+        return physical_bytes
+
     def read_tensor(self, entry: dict) -> torch.Tensor:
         """Read one indexed tensor into an independent CPU tensor."""
         dtype = _dtype_of(entry["dtype"])
@@ -511,13 +670,21 @@ def load_ftw_banks(
 
     reader = FTWReader(path)
     bank_entries = reader.entries("experts_bank")
-    if not bank_entries:
+    pages_meta = reader.meta("expert_pages")
+    if not bank_entries and pages_meta is None:
         reader.close()
         return None
 
-    alpha_entries = [e for e in bank_entries if e["name"] in _ALPHA_NAMES]
-    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
-
+    alpha_entries = [
+        entry
+        for entry in bank_entries
+        if entry["name"] in _ALPHA_NAMES
+    ]
+    row_entries = [
+        entry
+        for entry in bank_entries
+        if entry["name"] not in _ALPHA_NAMES
+    ]
     meta_layers = reader.meta("expert_bank_num_layers")
     if meta_layers is not None and meta_layers != num_layers:
         reader.close()
@@ -551,6 +718,7 @@ def load_ftw_banks(
     row_view_args: dict[str, list] = {}
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
     layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
+    page_jobs = []
 
     for e in flat_entries:
         name = e["name"]
@@ -588,12 +756,69 @@ def load_ftw_banks(
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id))
 
-    total_bytes = sum(e["nbytes"] for e in bank_entries)
+    if pages_meta is not None:
+        if int(pages_meta.get("version", 0)) != 1:
+            raise ValueError("unsupported FTW expert-page metadata version")
+        page_groups: dict[str, dict[int, list[tuple[int, dict]]]] = {}
+        for page in pages_meta.get("pages", []):
+            layer_id = int(page["layer"])
+            expert_id = int(page["expert"])
+            for item in page["banks"]:
+                page_groups.setdefault(item["name"], {}).setdefault(
+                    layer_id, []
+                ).append((expert_id, {**page, "bank": item}))
+        for name, by_layer in page_groups.items():
+            if name in row_hb:
+                raise ValueError(
+                    f"FTW bank {name!r} mixes expert pages and bank rows"
+                )
+            row_hb[name] = []
+            row_view_args[name] = []
+            for layer_id in range(num_layers):
+                indexed = sorted(by_layer.get(layer_id, []))
+                if [expert for expert, _item in indexed] != list(
+                    range(len(indexed))
+                ):
+                    raise ValueError(
+                        f"FTW expert pages for {name!r} layer {layer_id} "
+                        "are incomplete"
+                    )
+                first = indexed[0][1]["bank"]
+                row_shape = tuple(first["shape"])
+                dtype = _dtype_of(first["dtype"])
+                bank = HostBank(
+                    (len(indexed), *row_shape),
+                    dtype,
+                    backing=_backing(layer_id),
+                )
+                locations = [
+                    (
+                        int(item["global_off"])
+                        + int(item["bank"]["offset"]),
+                        int(item["bank"]["nbytes"]),
+                    )
+                    for _expert, item in indexed
+                ]
+                row_hb[name].append(bank)
+                row_view_args[name].append(None)
+                page_jobs.append(
+                    (name, bank, locations, layer_id)
+                )
+
+    total_bytes = sum(e["nbytes"] for e in bank_entries) + sum(
+        int(page["nbytes"])
+        for page in (pages_meta or {}).get("pages", [])
+    )
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
-    n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs)
+    n_jobs = (
+        len(alpha_entries)
+        + len(row_jobs)
+        + len(layer_jobs)
+        + len(page_jobs)
+    )
     try:
         with PinPipeline() as pins:
 
@@ -616,12 +841,43 @@ def load_ftw_banks(
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
-            with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
-                futures = [ex.submit(_read_alpha, e) for e in alpha_entries]
-                futures += [ex.submit(_read_row, job) for job in row_jobs]
-                futures += [ex.submit(_read_layer, job) for job in layer_jobs]
-                for f in futures:
-                    f.result()
+
+            def _read_page_bank(job):
+                _name, bank, locations, layer_id = job
+                row_bytes = locations[0][1]
+                destination = bank.memoryview()
+                for expert_id, (offset, nbytes) in enumerate(locations):
+                    if nbytes != row_bytes:
+                        raise ValueError("FTW expert-page bank row size changes")
+                    reader.read_range_into(
+                        destination[
+                            expert_id * row_bytes : (expert_id + 1) * row_bytes
+                        ],
+                        offset,
+                        nbytes,
+                        workers=workers,
+                        chunk=chunk,
+                    )
+                pins.submit(bank, residency[layer_id])
+                bar.update(row_bytes * len(locations))
+            with ThreadPoolExecutor(
+                min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))
+            ) as ex:
+                futures = [
+                    ex.submit(_read_alpha, entry)
+                    for entry in alpha_entries
+                ]
+                futures += [
+                    ex.submit(_read_row, job) for job in row_jobs
+                ]
+                futures += [
+                    ex.submit(_read_layer, job) for job in layer_jobs
+                ]
+                futures += [
+                    ex.submit(_read_page_bank, job) for job in page_jobs
+                ]
+                for future in futures:
+                    future.result()
     finally:
         bar.close()
         reader.close()
@@ -672,11 +928,20 @@ def load_ftw_banks(
             f"{pageable_part}"
         )
 
-    # alphas are the small per-expert scale vectors, distinguished by their reserved names
-    # (not a separate kind); everything else under experts_bank is a weight source.
-    alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
+    # Alphas are small per-expert vectors with fixed GPU residency.
     return ExpertBanks(
-        reader.meta("quant_format"), sources, **alpha_kw,
+        quant_format=reader.meta("quant_format"),
+        sources=sources,
+        gate_up_alpha=(
+            alpha_hb["gate_up_alpha"].tensor
+            if "gate_up_alpha" in alpha_hb
+            else None
+        ),
+        down_alpha=(
+            alpha_hb["down_alpha"].tensor
+            if "down_alpha" in alpha_hb
+            else None
+        ),
         layer_residency=applied,
     )
 

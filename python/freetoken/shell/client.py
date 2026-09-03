@@ -184,6 +184,8 @@ class ShellClient:
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
         ram_bytes: int | None = None,
+        controller_enabled: bool | None = None,
+        controller_limits: dict[str, int] | None = None,
         wait: float = 300.0,
     ) -> dict[str, Any]:
         """Resize cache pools. Every count is in the endpoint's own unit -- slots for moe/mamba,
@@ -197,6 +199,8 @@ class ShellClient:
             ("num_mamba_slots", num_mamba_slots),
             ("num_swa_pages", num_swa_pages),
             ("ram_bytes", ram_bytes),
+            ("controller_enabled", controller_enabled),
+            ("controller_limits", controller_limits),
         ):
             if value is not None:
                 body[key] = value
