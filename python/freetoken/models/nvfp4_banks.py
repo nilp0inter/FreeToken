@@ -138,13 +138,13 @@ def _load_nvfp4_layers_bounded(
     globals_by_layer = _by_layer(global_shards)
     streamed = {name: [] for name in native_names}
     expected = E * 6
+    hb = _alloc_nvfp4_host_banks(1, E, H, I, backing="mmap")
 
     for layer_id in tqdm(
         range(num_layers),
         desc=f"Loading {spec.desc} (bounded layers)",
         disable=not primary,
     ):
-        hb = _alloc_nvfp4_host_banks(1, E, H, I, backing="mmap")
         layer_banks = {name: hb[name][0] for name in native_names}
         tensors = {name: bank.tensor for name, bank in layer_banks.items()}
         globals_map: dict[tuple[int, int, str], torch.Tensor] = {}
@@ -214,7 +214,8 @@ def _load_nvfp4_layers_bounded(
             )
             layer_sink(layer_id, layer_banks)
             for name, bank in layer_banks.items():
-                streamed[name].append(bank.tensor)
+                streamed[name].append(None)
+                bank.release()
         except BaseException:
             for bank in layer_banks.values():
                 bank.release()
